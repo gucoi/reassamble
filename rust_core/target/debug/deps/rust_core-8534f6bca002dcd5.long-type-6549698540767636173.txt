@@ -1,0 +1,2 @@
+futures_util::future::try_future::MapErr<impl core::future::future::Future<Output = result::Result<core::option::Option<Vec<u8>>, ReassembleError>>, {closure@src/lib.rs:88:37: 88:40}>
+futures::future::MapErr<impl futures::Future<Output = std::result::Result<std::option::Option<Vec<u8>>, ReassembleError>>, {closure@src/lib.rs:88:37: 88:40}>

@@ -1,67 +1,20 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Config {
-    pub capture: CaptureConfig,
-    pub decode: DecodeConfig,
-    pub reassemble: ReassembleConfig, 
-    pub output: OutputConfig,
+    pub defrag_timeout: u64,      // IP分片超时时间（秒）
+    pub stream_timeout: u64,      // 流超时时间（秒）
+    pub max_fragments: usize,     // 每个 IP 分片组的最大分片数
+    pub max_streams: usize,       // 最大并发流数量
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CaptureConfig {
-    pub interface: String,
-    pub bpf_filter: Option<String>,
-    pub buffer_size: usize,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DecodeConfig {
-    pub check_checksum: bool,
-    pub store_raw: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ReassembleConfig {
-    pub timeout: u64,
-    pub max_segments: usize,
-    pub max_packets: usize,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct OutputConfig {
-    pub format: OutputFormat,
-    pub path: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum OutputFormat {
-    Json,
-    Pcap,
-    Csv,
-}
-
-impl Config {
-    pub fn new() -> Self {
-        Config {
-            capture: CaptureConfig {
-                interface: String::from("any"),
-                bpf_filter: None,
-                buffer_size: 65536,
-            },
-            decode: DecodeConfig {
-                check_checksum: true,
-                store_raw: false,
-            },
-            reassemble: ReassembleConfig {
-                timeout: 30,
-                max_segments: 1024,
-                max_packets: 65536,
-            },
-            output: OutputConfig {
-                format: OutputFormat::Pcap,
-                path: String::from("output.pcap"),
-            },
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            defrag_timeout: 30,
+            stream_timeout: 300,
+            max_fragments: 1024,
+            max_streams: 10000,
         }
     }
 }

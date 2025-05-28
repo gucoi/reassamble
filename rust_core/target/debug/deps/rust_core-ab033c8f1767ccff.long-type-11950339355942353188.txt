@@ -1,0 +1,2 @@
+impl core::future::future::Future<Output = result::Result<core::option::Option<Vec<u8>>, ReassembleError>>
+impl futures::Future<Output = std::result::Result<std::option::Option<Vec<u8>>, ReassembleError>>

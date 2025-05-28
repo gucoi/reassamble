@@ -1,0 +1,1 @@
+impl core::future::future::Future<Output = result::Result<core::option::Option<Vec<u8>>, ReassembleError>>
