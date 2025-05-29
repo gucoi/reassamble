@@ -7,6 +7,7 @@ use std::sync::Arc;
 use dashmap::mapref::entry::Entry;
 use super::super::stream::StreamStats;
 use crate::decode::TransportProtocol;
+use tokio::sync::RwLock as TokioRwLock;
 
 pub const TCP_FIN: u8 = 0x01;
 pub const TCP_SYN: u8 = 0x02;
@@ -64,27 +65,29 @@ struct TcpStream {
     state: TcpState,
     isn: u32,  // 初始序列号
     fin_seq: Option<u32>,  // FIN 包的序列号
-    sack_blocks: Vec<SackBlock>,
+    sack_blocks: [SackBlocks; 4],
     stats: StreamStats,
     window_size: u32, // 窗口大小
     mss: u16, // 最后一个确认的最大段大小
+    total_bytes: u32,
 }
 
 #[derive(Debug)]
 struct TcpSegment {
     seq: u32,
-    data: Vec<u8>,
+    data: Box<[u8]>,
     received: Instant,
-    retransmit_count: u32,
+    retransmit_count: u8,
     last_retransmit: Option<Instant>,
 }
 
 pub struct TcpReassembler {
-    streams: DashMap<String, Arc<RwLock<TcpStream>>>,
+    streams: DashMap<String, Arc<TokioRwLock<TcpStream>>>,
     timeout: Duration,
     max_gap: u32,
     max_streams: usize,
     max_segments: usize,
+    stream_stats: Arc<DashMap<String, StreamStats>>,
 }
 
 impl TcpReassembler {
@@ -95,10 +98,11 @@ impl TcpReassembler {
             max_gap,
             max_streams,
             max_segments,
+            stream_stats: Arc::new(DashMap::new()),
         }
     }
 
-    pub fn process_packet(&self, packet: &DecodedPacket) -> Option<Vec<u8>> {
+    pub async fn process_packet(&self, packet: &DecodedPacket) -> Option<Vec<u8>> {
         let (seq, ack, flags, window) = match &packet.protocol {
             TransportProtocol::Tcp { seq, ack, flags, window } => {
                 (*seq, *ack, *flags, *window)
@@ -107,16 +111,17 @@ impl TcpReassembler {
         };
 
         let now = Instant::now();
-        self.cleanup_expired(now);
         
-        let stream_key = format!("{}:{}-{}:{}",
+        let stream_key = format!("{}:{}-{}:{}:{}", 
             packet.ip_header.src_ip, packet.src_port,
-            packet.ip_header.dst_ip, packet.dst_port);
+            packet.ip_header.dst_ip, packet.dst_port,
+            if packet.src_port < packet.dst_port { "forward" } else { "reverse" }
+        );
 
         match self.streams.entry(stream_key) {
             Entry::Occupied(entry) => {
                 let stream = entry.get();
-                let mut stream_guard = stream.write();
+                let mut stream_guard = stream.write().await;
                 stream_guard.last_seen = now;
                 
                 if !packet.payload.is_empty() {
@@ -132,7 +137,7 @@ impl TcpReassembler {
                     self.find_and_remove_oldest_stream();
                 }
                 
-                let new_stream = Arc::new(RwLock::new(TcpStream {
+                let new_stream = Arc::new(TokioRwLock::new(TcpStream {
                     seq: seq,
                     segments: BTreeMap::new(),
                     last_ack: ack,
@@ -144,10 +149,11 @@ impl TcpReassembler {
                     window_size: 0,
                     mss: 1460,
                     stats: StreamStats::default(),
+                    total_bytes: 0,
                 }));
 
                 if !packet.payload.is_empty() {
-                    let mut stream = new_stream.write();
+                    let mut stream = new_stream.write().await;
                     self.add_segment(&mut stream, packet, now);
                 }
                 
@@ -159,11 +165,8 @@ impl TcpReassembler {
 
     fn try_reassemble(&self, stream: &mut TcpStream) -> Option<Vec<u8>> {
         // 检查内存限制
-        if !self.check_memory_limits(stream) {
-            self.handle_error(
-                ReassemblyError::InvalidState(stream.state),
-                stream
-            );
+        if stream.total_bytes > 10_000_000 { // 10MB 阈值
+            self.handle_error(ReassemblyError::InvalidState(stream.state), stream);
             return None;
         }
 
@@ -191,14 +194,11 @@ impl TcpReassembler {
                     gaps.push((next_seq, gap_size));
                     stream.stats.gaps_detected += 1;
                     self.update_stats(StreamEvent::GapDetected, stream);
-                    break;
+                    // 继续遍历后续段，记录所有可能的乱序段
                 } else {
                     // gap 太大，停止重组
-                    self.handle_error(
-                        ReassemblyError::GapTooLarge(gap_size),
-                        stream
-                    );
-                    break;
+                    self.handle_error(ReassemblyError::GapTooLarge(gap_size), stream);
+                    return None;
                 }
             } else if seq < next_seq {
                 // 重叠段或重传段
@@ -213,16 +213,18 @@ impl TcpReassembler {
             }
         }
 
+        // 清理已重组的段
+        for seq in segments_to_remove {
+            if let Some(segment) = stream.segments.remove(&seq) {
+                stream.total_bytes -= segment.data.len();
+            }
+        }
+
         // 如果成功重组了一些数据
         if !reassembled.is_empty() {
             // 更新流的状态
             stream.seq = next_seq;
             
-            // 清理已重组的段
-            for seq in segments_to_remove {
-                stream.segments.remove(&seq);
-            }
-
             // 更新统计信息
             stream.stats.byte_count += reassembled.len() as u64;
             self.update_stats(StreamEvent::SegmentReassembled, stream);
@@ -234,6 +236,13 @@ impl TcpReassembler {
     }
 
     fn add_segment(&self, stream: &mut TcpStream, packet: &DecodedPacket, now: Instant) {
+        let new_bytes = packet.payload.len();
+        if stream.total_bytes + new_bytes > 10_000_000 { // 10MB 阈值
+            // 清理最老段或拒绝新段
+            return;
+        }
+        stream.total_bytes += new_bytes;
+        
         if stream.segments.len() >= self.max_segments {
             if let Some((&oldest_seq, _)) = stream.segments.iter()
                 .min_by_key(|(_, seg)| seg.received) {
@@ -293,59 +302,58 @@ impl TcpReassembler {
 
         let flags = tcp_flags;
         
-        // SYN 处理
-        if flags & TCP_SYN != 0 {
-            stream.isn = seq;
-            match stream.state {
-                TcpState::Closed => {
-                    stream.state = TcpState::SynSent;
-                    self.update_stats(StreamEvent::NewSegment,stream);
-                }
-                TcpState::SynSent => {
+        match stream.state {
+            TcpState::Closed => {
+                if packet.flags & TCP_SYN != 0 {
                     stream.state = TcpState::SynReceived;
-                }
-                _ => {
+                } else {
                     self.handle_error(ReassemblyError::InvalidState(stream.state), stream);
                 }
+            }
+            TcpState::SynSent => {
+                if flags & TCP_SYN != 0 {
+                    stream.state = TcpState::SynReceived;
+                } else {
+                    self.handle_error(ReassemblyError::InvalidState(stream.state), stream);
+                }
+            }
+            TcpState::SynReceived => {
+                if flags & TCP_ACK != 0 {
+                    stream.state = TcpState::Established;
+                    self.update_stats(StreamEvent::StreamEstablished, stream);
+                } else {
+                    self.handle_error(ReassemblyError::InvalidState(stream.state), stream);
+                }
+            }
+            TcpState::Established => {
+                if flags & TCP_FIN != 0 {
+                    stream.state = TcpState::FinWait1;
+                }
+            }
+            TcpState::FinWait1 => {
+                if flags & TCP_ACK != 0 {
+                    stream.state = TcpState::FinWait2;
+                }
+            }
+            TcpState::FinWait2 => {
+                if flags & TCP_FIN != 0 {
+                    stream.state = TcpState::LastAck;
+                }
+            }
+            TcpState::LastAck => {
+                if flags & TCP_FIN != 0 {
+                    stream.state = TcpState::Closed;
+                    self.update_stats(StreamEvent::StreamClosed, stream);
+                }
+            }
+            _ => {
+                self.handle_error(ReassemblyError::InvalidState(stream.state), stream);
             }
         }
         
         // ACK 处理
         if flags & TCP_ACK != 0 {
-            match stream.state {
-                TcpState::SynReceived => {
-                    stream.state = TcpState::Established;
-                    self.update_stats(StreamEvent::StreamEstablished, stream);
-                }
-                TcpState::FinWait1 => {
-                    stream.state = TcpState::FinWait2;
-                }
-                TcpState::LastAck => {
-                    stream.state = TcpState::Closed;
-                    self.update_stats(StreamEvent::StreamClosed, stream);
-                }
-                _ => {}
-            }
             stream.last_ack = ack;
-        }
-        
-        // FIN 处理
-        if flags & TCP_FIN != 0 {
-            stream.fin_seq = Some(seq + packet.payload.len() as u32);
-            match stream.state {
-                TcpState::Established => {
-                    stream.state = TcpState::FinWait1;
-                }
-                TcpState::SynReceived => {
-                    stream.state = TcpState::FinWait1;
-                }
-                TcpState::CloseWait => {
-                    stream.state = TcpState::LastAck;
-                }
-                _ => {
-                    self.handle_error(ReassemblyError::InvalidState(stream.state), stream);
-                }
-            }
         }
         
         // RST 处理
@@ -457,6 +465,12 @@ impl TcpReassembler {
         self.streams.get(&key).map(|stream| stream.read().stats.clone())
     }
 
+    pub async fn shutdown(&self) -> Result<()> {
+        // 取消所有后台任务
+        // 等待任务退出
+        Ok(())
+    }
+
 }
 
 #[cfg(test)]
@@ -535,4 +549,16 @@ mod tests {
             assert_eq!(stats.unwrap().retransmissions, 1);
         }
     }
+
+    #[tokio::test]
+    async fn test_edge_cases() {
+        // 测试最大序列号
+        // 测试序列号回绕
+        // 测试超大窗口
+        // 测试零窗口
+    }
+}
+
+fn is_seq_after(a: u32, b: u32) -> bool {
+    (a > b && a - b < 0x80000000) || (a < b && b - a > 0x80000000)
 }

@@ -1,7 +1,19 @@
 mod decode;
-mod decode_tcp;
-mod decode_udp;
+mod error;
 
-pub use decode::{DecodedPacket, IpHeader, decode_ip_header, decode_packet, TransportProtocol};
-pub use decode_tcp::decode_tcp_packet;
-pub use decode_udp::decode_udp_packet;
+pub use decode::{
+    DecodedPacket,
+    IpHeader,
+    TransportProtocol,
+    decode_ip_header,
+    decode_packet,
+    decode_packet_with_buffer,
+};
+pub use error::{
+    DecodeError,
+    DecodeResult,
+    IpHeaderError,
+    TcpHeaderError,
+    UdpHeaderError,
+    BufferError,
+};

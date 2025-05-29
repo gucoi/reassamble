@@ -4,6 +4,7 @@ pub mod decode;
 pub mod defrag;
 pub mod stream;
 pub mod processor;
+pub mod ffi;
 
 
 // Re-export commonly used types
@@ -16,6 +17,11 @@ pub use tokio::runtime::Runtime;
 pub use std::sync::OnceLock;
 pub use std::sync::Arc;
 use futures::TryFutureExt;
+
+// 重新导出常用类型
+pub use ffi::types::{CapturePacket, ReassemblePacket};
+pub use ffi::capture::{capture_init, capture_start, capture_stop};
+pub use ffi::reassemble::process_reassemble_packet;
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 

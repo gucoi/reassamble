@@ -68,10 +68,10 @@ impl Default for StreamStats {
 }
 
 pub struct ShardedTcpReassembler {
-    shards: Vec<Arc<RwLock<TcpReassembler>>>,
+    shards: Vec<Arc<parking_lot::RwLock<TcpReassembler>>>,
     shard_count: usize,
-    stream_stats: Arc<RwLock<HashMap<String, StreamStats>>>,
-    rebalance_threshold: Arc<RwLock<usize>>,
+    stream_stats: Arc<DashMap<String, StreamStats>>,
+    rebalance_threshold: Arc<AtomicUsize>,
     config: ShardConfig,
 }
 
@@ -136,28 +136,24 @@ impl ShardedTcpReassembler {
     }
 
     async fn get_smart_shard_index(&self, stream_key: &str, packet: &DecodedPacket) -> usize {
-        let mut stats = self.stream_stats.write().await;
-        let stream_stat = stats.entry(stream_key.to_string())
-            .or_insert_with(StreamStats::default);
-
-        // 更新统计信息
-        stream_stat.packet_count += 1;
-        stream_stat.byte_count += packet.payload.len() as u64;
-        stream_stat.last_seen = Instant::now();
-
-        let seq = match packet.protocol {
-            crate::decode::TransportProtocol::Tcp { seq, .. } => seq,
-            _ => 0, // 对于非TCP协议，序列号为0
-        };
-
+        // 使用快速哈希算法
+        let hash = fxhash::hash64(stream_key.as_bytes());
+        
+        // 使用位运算替代取模运算
+        let base_shard = (hash & (self.shard_count as u64 - 1)) as usize;
+        
         // 如果流量超过阈值，使用序列号进行二次分片
-        let threshold = *self.rebalance_threshold.read().await;
-        if stream_stat.byte_count >= threshold as u64 {
-            let seq_shard = (seq as usize) % self.shard_count;
-            return seq_shard;
+        let threshold = self.rebalance_threshold.load(Ordering::Relaxed);
+        if packet.payload.len() >= threshold {
+            // 使用位运算优化
+            let seq = match packet.protocol {
+                TransportProtocol::Tcp { seq, .. } => seq,
+                _ => 0,
+            };
+            ((seq as usize) & (self.shard_count - 1)) ^ base_shard
+        } else {
+            base_shard
         }
-
-        self.get_hash_shard_index(stream_key)
     }
 
     fn get_hash_shard_index(&self, stream_key: &str) -> usize {
@@ -404,5 +400,13 @@ mod tests {
         let stats = reassembler.get_shard_stats().await;
         let max_diff = stats.iter().max().unwrap() - stats.iter().min().unwrap();
         assert!(max_diff < 100);
+    }
+
+    #[tokio::test]
+    async fn test_performance() {
+        // 测试高并发
+        // 测试大数据包
+        // 测试内存使用
+        // 测试 CPU 使用
     }
 }

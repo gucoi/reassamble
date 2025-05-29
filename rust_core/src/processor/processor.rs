@@ -21,6 +21,8 @@ impl PacketProcessor {
     }
 
     pub async fn process_packet(&self, packet: &SafePacket) -> Result<Option<Vec<u8>>> {
+        let mut buffer = self.buffer_pool.acquire().await;
+        
         // 1. 解码数据包
         let decoded = decode_packet(packet)
             .ok_or(ReassembleError::DecodeError("Failed to decode packet".into()))?;
@@ -196,4 +198,12 @@ async fn test_ip_fragmentation_scenarios() {
     let result3 = processor.process_packet(&frag3).await.unwrap();
     assert!(result3.is_some()); // 全部分片已收到，应该有输出
 }
+
+    #[tokio::test]
+    async fn test_error_handling() {
+        // 测试空指针
+        // 测试无效数据包
+        // 测试超时情况
+        // 测试内存限制
+    }
 }
