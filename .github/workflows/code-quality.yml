@@ -1,0 +1,43 @@
+name: Code Quality
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  code-quality:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+    
+    - name: Install C++ dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang-tidy cppcheck
+    
+    - name: Rust Clippy
+      run: |
+        cd rust_core
+        cargo clippy -- -D warnings
+    
+    - name: Rust Format Check
+      run: |
+        cd rust_core
+        cargo fmt -- --check
+    
+    - name: C++ Format Check
+      run: |
+        find c_capture -name "*.cpp" -o -name "*.hpp" | xargs clang-format --dry-run -Werror
+    
+    - name: C++ Static Analysis
+      run: |
+        cd c_capture
+        cppcheck --enable=all --suppress=missingIncludeSystem src/ include/ 

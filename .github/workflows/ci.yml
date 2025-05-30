@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+    
+    - name: Install C++ dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake libpcap-dev
+    
+    - name: Build Rust Core
+      run: |
+        cd rust_core
+        cargo build --verbose
+    
+    - name: Run Rust Tests
+      run: |
+        cd rust_core
+        cargo test --verbose
+    
+    - name: Build C Capture
+      run: |
+        cd c_capture
+        mkdir -p build
+        cd build
+        cmake ..
+        make
+    
+    - name: Run C Tests
+      run: |
+        cd c_capture/build
+        ctest --output-on-failure 
