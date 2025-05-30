@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use crate::decode::{DecodedPacket, IpHeader};
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 struct IpFragment {
@@ -31,7 +31,7 @@ struct DefragStats {
 }
 
 pub struct IpDefragmenter {
-    fragments: HashMap<(IpAddr, IpAddr, u16), FragmentGroup>,
+    fragments: Mutex<HashMap<(IpAddr, IpAddr, u16), FragmentGroup>>,
     timeout: Duration,
     group_timeout: Duration,  // 分片组整体超时时间
     max_fragments: usize,     // 单个分片组最大分片数
@@ -41,7 +41,7 @@ pub struct IpDefragmenter {
 impl IpDefragmenter {
     pub fn new(timeout_secs: u64, group_timeout_secs: u64, max_fragments: usize) -> Self {
         Self {
-            fragments: HashMap::new(),
+            fragments: Mutex::new(HashMap::new()),
             timeout: Duration::from_secs(timeout_secs),
             group_timeout: Duration::from_secs(group_timeout_secs),
             max_fragments,
@@ -62,8 +62,9 @@ impl IpDefragmenter {
     fn cleanup_expired_fragments(&self) {
         let now = Instant::now();
         let mut expired_keys = Vec::new();
+        let mut fragments = self.fragments.lock().unwrap();
 
-        for (key, group) in &self.fragments {
+        for (key, group) in fragments.iter() {
             // 检查分片组是否整体超时
             if now.duration_since(group.first_seen) > self.group_timeout {
                 expired_keys.push(key.clone());
@@ -83,16 +84,17 @@ impl IpDefragmenter {
                 expired_keys.push(key.clone());
             }
         }
-
         // 移除超时的分片组
         for key in expired_keys {
-            self.fragments.remove(&key);
+            fragments.remove(&key);
         }
     }
 
     pub fn process_packet(&mut self, packet: &DecodedPacket) -> Option<DecodedPacket> {
+        println!("[defrag] process_packet: fragment_offset={}, flags=0x{:x}, payload_len={}", packet.ip_header.fragment_offset, packet.ip_header.flags, packet.payload.len());
         // 如果不是分片包，直接返回
-        if packet.ip_header.fragment_offset == 0 && (packet.ip_header.flags & 0x2000) == 0 {
+        if packet.ip_header.fragment_offset == 0 && (packet.ip_header.flags & 0x20) == 0 {
+            println!("[defrag] not a fragment, return Some");
             return Some(packet.clone());
         }
 
@@ -103,8 +105,9 @@ impl IpDefragmenter {
             packet.ip_header.identification
         );
 
+        let mut fragments = self.fragments.lock().unwrap();
         // 获取或创建分片组
-        let group = self.fragments.entry(key).or_insert_with(|| FragmentGroup {
+        let group = fragments.entry(key).or_insert_with(|| FragmentGroup {
             fragments: Vec::new(),
             first_seen: now,
             last_seen: now,
@@ -115,15 +118,18 @@ impl IpDefragmenter {
         // 更新分片组信息
         group.last_seen = now;
         group.received_fragments += 1;
+        println!("[defrag] group now has {} fragments", group.fragments.len() + 1);
 
         // 检查分片组是否超时
         if now.duration_since(group.first_seen) > self.group_timeout {
-            self.fragments.remove(&key);
+            println!("[defrag] group timeout, remove group");
+            fragments.remove(&key);
             return None;
         }
 
         // 检查分片数量限制
         if group.fragments.len() >= self.max_fragments {
+            println!("[defrag] too many fragments, drop");
             return None;
         }
 
@@ -131,24 +137,30 @@ impl IpDefragmenter {
         let fragment = IpFragment {
             data: packet.payload.clone(),
             offset: packet.ip_header.fragment_offset,
-            more_fragments: packet.ip_header.flags & 0x2000 != 0,
+            more_fragments: packet.ip_header.flags & 0x20 != 0,
             received_time: now,
         };
 
         group.fragments.push(fragment);
         group.fragments.sort_by_key(|f| f.offset);
+        println!("[defrag] fragments after push: offsets={:?}", group.fragments.iter().map(|f| f.offset).collect::<Vec<_>>());
 
         // 尝试重组
+        drop(fragments); // 显式释放锁
         self.try_reassemble(packet, key)
     }
 
     fn try_reassemble(&mut self, original: &DecodedPacket, key: (IpAddr, IpAddr, u16)) -> Option<DecodedPacket> {
-        let group = self.fragments.get(&key)?;
+        println!("[defrag] try_reassemble: key={:?}", key);
+        let mut fragments = self.fragments.lock().unwrap();
+        let group = fragments.get(&key)?;
         let now = Instant::now();
+        println!("[defrag] try_reassemble: group.fragments.len()={}", group.fragments.len());
 
         // 检查分片组是否超时
         if now.duration_since(group.first_seen) > self.group_timeout {
-            self.fragments.remove(&key);
+            println!("[defrag] try_reassemble: group timeout");
+            fragments.remove(&key);
             return None;
         }
 
@@ -158,49 +170,61 @@ impl IpDefragmenter {
         let mut gaps = Vec::new();
         let mut prev_end = 0;
 
-        for fragment in &group.fragments {
+        for (i, fragment) in group.fragments.iter().enumerate() {
+            println!("[defrag] fragment[{}]: offset={}, len={}, more_fragments={}", i, fragment.offset, fragment.data.len(), fragment.more_fragments);
             // 检查分片是否超时
             if now.duration_since(fragment.received_time) > self.timeout {
-                self.fragments.remove(&key);
+                println!("[defrag] try_reassemble: fragment timeout");
+                fragments.remove(&key);
                 return None;
             }
 
             // 检查分片是否连续
             if fragment.offset as usize > prev_end {
+                println!("[defrag] try_reassemble: gap detected: prev_end={}, offset={}", prev_end, fragment.offset);
                 gaps.push((prev_end, fragment.offset as usize));
             }
 
             if !fragment.more_fragments {
                 has_last_fragment = true;
                 total_len = fragment.offset as usize + fragment.data.len();
+                println!("[defrag] try_reassemble: found last fragment, total_len={}", total_len);
             }
 
             prev_end = fragment.offset as usize + fragment.data.len();
         }
 
         // 如果没有收到最后一个分片，或者存在间隙，则继续等待
-        if !has_last_fragment || !gaps.is_empty() {
+        if !has_last_fragment {
+            println!("[defrag] try_reassemble: no last fragment");
+            return None;
+        }
+        if !gaps.is_empty() {
+            println!("[defrag] try_reassemble: gaps exist: {:?}", gaps);
             return None;
         }
 
         // 重组分片
         let mut reassembled = vec![0u8; total_len];
-        for fragment in &group.fragments {
+        for (i, fragment) in group.fragments.iter().enumerate() {
             let start = fragment.offset as usize;
             let end = start + fragment.data.len();
             if end > reassembled.len() {
+                println!("[defrag] try_reassemble: fragment out of bounds: start={}, end={}, reassembled.len={}", start, end, reassembled.len());
                 return None; // 分片越界
             }
+            println!("[defrag] try_reassemble: copy fragment[{}] to reassembled[{}..{}]", i, start, end);
             reassembled[start..end].copy_from_slice(&fragment.data);
         }
 
         // 重组成功，移除分片组
-        self.fragments.remove(&key);
+        println!("[defrag] try_reassemble: reassembly success, remove group");
+        fragments.remove(&key);
         Some(DecodedPacket {
             timestamp: original.timestamp,
             ip_header: IpHeader {
                 fragment_offset: 0,
-                flags: original.ip_header.flags & !0x2000,
+                flags: original.ip_header.flags & !0x20,
                 total_length: ((original.ip_header.ihl as usize * 4) + total_len) as u16,
                 ..original.ip_header.clone()
             },
@@ -213,7 +237,8 @@ impl IpDefragmenter {
 
     pub fn get_stats(&self) -> DefragStats {
         let mut stats = DefragStats::default();
-        stats.current_groups = self.fragments.len();
+        let fragments = self.fragments.lock().unwrap();
+        stats.current_groups = fragments.len();
         // ... 统计其他指标
         stats
     }
@@ -232,7 +257,7 @@ mod tests {
                 ihl: 5,
                 total_length: (20 + data.len()) as u16,
                 identification: 1,
-                flags: if more_fragments { 0x2000 } else { 0 },
+                flags: if more_fragments { 0x20 } else { 0 },
                 fragment_offset: offset,
                 ttl: 64,
                 protocol: 6,
@@ -267,7 +292,7 @@ mod tests {
         assert!(result2.is_none());
 
         // 最后一个分片
-        let packet3 = create_test_packet(14, false, b"test");
+        let packet3 = create_test_packet(15, false, b"test");
         let result3 = defragmenter.process_packet(&packet3);
         
         assert!(result3.is_some());

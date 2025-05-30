@@ -15,17 +15,15 @@ pub struct PacketProcessor {
 impl PacketProcessor {
     pub fn new(reassembler: Arc<ShardedTcpReassembler>) -> Self {
         Self {
-            defragmenter: Arc::new(RwLock::new(IpDefragmenter::new(10))),
+            defragmenter: Arc::new(RwLock::new(IpDefragmenter::new(30, 60, 10))),
             reassembler,
         }
     }
 
     pub async fn process_packet(&self, packet: &SafePacket) -> Result<Option<Vec<u8>>> {
-        let mut buffer = self.buffer_pool.acquire().await;
-        
         // 1. 解码数据包
         let decoded = decode_packet(packet)
-            .ok_or(ReassembleError::DecodeError("Failed to decode packet".into()))?;
+            .map_err(|e| ReassembleError::DecodeError(e.to_string()))?;
 
         // 2. IP 分片重组
         let defrag_result = {
@@ -38,7 +36,7 @@ impl PacketProcessor {
             Some(complete_packet) => {
                 match complete_packet.protocol {
                     TransportProtocol::Tcp { .. } => {
-                        Ok(self.reassembler.process_packet(&complete_packet).await)
+                        Ok(self.reassembler.process_packet(&complete_packet))
                     }
                     TransportProtocol::Udp => {
                         Ok(Some(complete_packet.payload))

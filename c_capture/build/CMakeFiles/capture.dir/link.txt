@@ -1,0 +1,1 @@
+/usr/bin/cc -fPIC -shared -Wl,-soname,libcapture.so -o lib/libcapture.so CMakeFiles/capture.dir/src/capture.c.o CMakeFiles/capture.dir/src/backends/pcap_backend.c.o  -lpcap 

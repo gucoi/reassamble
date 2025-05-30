@@ -52,3 +52,45 @@ pub enum CaptureBackendType {
 pub struct CaptureHandle {
     _private: [u8; 0],
 } 
+
+// 设备信息结构
+#[repr(C)]
+pub struct CaptureDevice {
+    pub name: *const c_char,
+    pub description: *const c_char,
+    pub addresses: *const c_char,
+    pub flags: u32,
+    pub mtu: u32,
+    pub speed: u32,
+    pub link_type: u32,
+}
+
+// 统计信息结构
+#[repr(C)]
+pub struct CaptureStats {
+    pub packets_received: u64,
+    pub packets_dropped: u64,
+    pub packets_if_dropped: u64,
+    pub bytes_received: u64,
+    pub bytes_dropped: u64,
+    pub bytes_if_dropped: u64,
+    pub errors: u64,
+    pub warnings: u64,
+    pub timestamp: timespec,
+}
+
+impl Default for CaptureStats {
+    fn default() -> Self {
+        Self {
+            packets_received: 0,
+            packets_dropped: 0,
+            packets_if_dropped: 0,
+            bytes_received: 0,
+            bytes_dropped: 0,
+            bytes_if_dropped: 0,
+            errors: 0,
+            warnings: 0,
+            timestamp: timespec { tv_sec: 0, tv_nsec: 0 },
+        }
+    }
+} 

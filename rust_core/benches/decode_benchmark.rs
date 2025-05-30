@@ -1,5 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use rust_core::decode::{decode_packet, decode_packet_with_buffer, SafePacket};
+use rust_core::decode::{decode_packet, decode_packet_with_buffer};
+use rust_core::SafePacket;
 use rand::Rng;
 use std::time::Duration;
 

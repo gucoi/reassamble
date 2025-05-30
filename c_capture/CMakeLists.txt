@@ -1,15 +1,16 @@
 cmake_minimum_required(VERSION 3.10)
-project(capture C)
+project(c_capture C)
 
 # 设置 C 标准
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-# 查找 libpcap
-find_package(PCAP REQUIRED)
+# 使用 pkg-config 查找 libpcap
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(PCAP REQUIRED libpcap)
 
 # 添加头文件目录
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
+include_directories(${PCAP_INCLUDE_DIRS} include)
 
 # 添加源文件
 set(SOURCES
@@ -34,7 +35,8 @@ install(TARGETS capture
     LIBRARY DESTINATION lib
     RUNTIME DESTINATION bin
 )
+
 install(DIRECTORY include/
-    DESTINATION include/capture
+    DESTINATION include/c_capture
     FILES_MATCHING PATTERN "*.h"
 ) 

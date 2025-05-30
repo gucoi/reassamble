@@ -1,0 +1,4 @@
+cargo:rustc-link-search=native=../c_capture/build/lib
+cargo:rustc-link-lib=dylib=capture
+cargo:rerun-if-changed=../c_capture/include
+cargo:rerun-if-changed=../c_capture/src

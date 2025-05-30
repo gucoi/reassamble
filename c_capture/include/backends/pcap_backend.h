@@ -2,6 +2,7 @@
 #define PCAP_BACKEND_H
 
 #include "capture_types.h"
+#include "capture_backend.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -92,7 +93,7 @@ capture_handle_t* pcap_backend_init(
 /**
  * 启动抓包
  */
-int pcap_backend_start(capture_handle_t* handle);
+int pcap_backend_start(capture_handle_t* handle, packet_callback_t packet_cb, void* user_data);
 
 /**
  * 停止抓包

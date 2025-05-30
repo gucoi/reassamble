@@ -3,48 +3,38 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <time.h>
+#include <stdio.h>
+#include <unistd.h>
 #include "../../include/backends/pcap_backend.h"
 #include "../../include/capture_types.h"
 
 struct pcap_backend {
-    pcap_t* handle;
-    char* device;
-    char* filter;
-    int snaplen;
-    int timeout_ms;
-    bool promiscuous;
-    bool immediate;
-    uint32_t buffer_size;
-    packet_callback_t packet_cb;
-    error_callback_t error_cb;
-    void* user_data;
-    void* error_user_data;
-    bool running;
+    capture_backend_t base;          // 基础后端结构
+    pcap_t* handle;                  // libpcap 句柄
+    char* device;                    // 设备名称
+    char* filter;                    // 过滤器
+    int snaplen;                     // 抓包长度
+    int timeout_ms;                  // 超时时间
+    bool promiscuous;                // 是否开启混杂模式
+    bool immediate;                  // 是否立即返回
+    uint32_t buffer_size;            // 缓冲区大小
+    packet_callback_t packet_cb;     // 数据包回调
+    error_callback_t error_cb;       // 错误回调
+    void* user_data;                 // 用户数据
+    void* error_user_data;           // 错误回调用户数据
+    bool running;                    // 是否正在运行
 };
 
-static void pcap_callback(u_char* user, const struct pcap_pkthdr* header, const u_char* packet) {
-    struct pcap_backend* backend = (struct pcap_backend*)user;
-    if (!backend->running) {
-        return;
-    }
+// 内部函数声明
+static void pcap_callback(u_char* user, const struct pcap_pkthdr* header, const u_char* packet);
+static int pcap_backend_open(void* backend, const char* device);
+static int pcap_backend_close(void* backend);
+static int pcap_backend_get_devices(void* backend, capture_device_t** devices, int* count);
+static void pcap_backend_free_devices(void* backend, capture_device_t* devices, int count);
+static const char* pcap_backend_get_name(void* backend);
+static const char* pcap_backend_get_description(void* backend);
 
-    packet_t pkt = {
-        .data = packet,
-        .len = header->len,
-        .caplen = header->caplen,
-        .ts = header->ts,
-        .if_index = 0,  // TODO: 获取接口索引
-        .flags = 0,
-        .protocol = 0,  // TODO: 解析协议类型
-        .vlan_tci = 0,
-        .hash = 0,
-    };
-
-    if (!backend->packet_cb(&pkt, backend->user_data)) {
-        backend->running = false;
-    }
-}
-
+// 公共接口实现
 capture_handle_t* pcap_backend_init(
     const capture_config_t* config,
     packet_callback_t packet_cb,
@@ -156,38 +146,132 @@ capture_handle_t* pcap_backend_init(
     return (capture_handle_t*)backend;
 }
 
-int pcap_backend_start(capture_handle_t* handle) {
+// pcap_callback 回调实现，修正 .ts 字段类型
+static void pcap_callback(u_char* user, const struct pcap_pkthdr* header, const u_char* packet) {
+    struct pcap_backend* backend = (struct pcap_backend*)user;
+    printf("[pcap_callback] enter, backend=%p, running=%d, user_data=%p\n", 
+           backend, backend ? backend->running : -1, backend ? backend->user_data : NULL);
+    
+    if (!backend) {
+        printf("[pcap_callback] ERROR: backend is NULL\n");
+        return;
+    }
+    
+    if (!backend->running) {
+        printf("[pcap_callback] backend not running, return\n");
+        return;
+    }
+    
+    if (!backend->packet_cb) {
+        printf("[pcap_callback] ERROR: packet_cb is NULL\n");
+        return;
+    }
+    
+    struct timespec ts;
+    ts.tv_sec = header->ts.tv_sec;
+    ts.tv_nsec = header->ts.tv_usec * 1000;
+    packet_t pkt = {
+        .data = packet,
+        .len = header->len,
+        .caplen = header->caplen,
+        .ts = ts,
+        .if_index = 0,
+        .flags = 0,
+        .protocol = 0,
+        .vlan_tci = 0,
+        .hash = 0,
+    };
+    
+    printf("[pcap_callback] before user callback, packet len=%d, caplen=%d\n", 
+           pkt.len, pkt.caplen);
+           
+    if (!backend->packet_cb(&pkt, backend->user_data)) {
+        printf("[pcap_callback] user callback returned false, set running=0\n");
+        backend->running = false;
+    }
+    printf("[pcap_callback] leave\n");
+}
+
+int pcap_backend_start(capture_handle_t* handle, packet_callback_t packet_cb, void* user_data) {
     struct pcap_backend* backend = (struct pcap_backend*)handle;
+    printf("[pcap_backend_start] enter, handle=%p, backend=%p, packet_cb=%p, user_data=%p\n",
+           handle, backend, packet_cb, user_data);
+           
     if (!backend || !backend->handle) {
+        printf("[pcap_backend_start] ERROR: Invalid handle or backend\n");
         return -1;
     }
-
+    
+    backend->user_data = user_data;
+    backend->packet_cb = packet_cb;  // 确保设置回调函数
+    
+    char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_t* test_handle = pcap_open_live(backend->device, backend->snaplen, 
+                                        backend->promiscuous, 1000, errbuf);
+    if (!test_handle) {
+        printf("[pcap_backend_start] ERROR: Device not available: %s\n", errbuf);
+        return -1;
+    }
+    pcap_close(test_handle);
+    
+    printf("[pcap_backend_start] Starting capture on device %s\n", backend->device);
     backend->running = true;
-    return pcap_loop(backend->handle, -1, pcap_callback, (u_char*)backend);
+    
+    int ret = pcap_loop(backend->handle, 10, pcap_callback, (u_char*)backend);
+    if (ret < 0) {
+        printf("[pcap_backend_start] ERROR: pcap_loop failed: %s\n", pcap_geterr(backend->handle));
+        backend->running = false;
+        return -1;
+    }
+    
+    printf("[pcap_backend_start] leave, ret=%d\n", ret);
+    return ret;
 }
 
 int pcap_backend_stop(capture_handle_t* handle) {
     struct pcap_backend* backend = (struct pcap_backend*)handle;
+    printf("[pcap_backend_stop] enter, handle=%p, backend=%p, running=%d\n", 
+           handle, backend, backend ? backend->running : -1);
+           
     if (!backend) {
+        printf("[pcap_backend_stop] ERROR: backend is NULL\n");
         return -1;
     }
-
+    
     backend->running = false;
+    if (backend->handle) {
+        printf("[pcap_backend_stop] calling pcap_breakloop, handle=%p\n", backend->handle);
+        pcap_breakloop(backend->handle);
+        usleep(100000);  // 等待100ms确保回调完成
+        
+        if (backend->handle) {
+            printf("[pcap_backend_stop] calling pcap_close, handle=%p\n", backend->handle);
+            pcap_close(backend->handle);
+            backend->handle = NULL;
+        }
+    }
+    
+    printf("[pcap_backend_stop] leave\n");
     return 0;
 }
 
 void pcap_backend_cleanup(capture_handle_t* handle) {
     struct pcap_backend* backend = (struct pcap_backend*)handle;
+    printf("[pcap_backend_cleanup] called, handle=%p, backend=%p\n", handle, backend);
     if (!backend) {
+        printf("[pcap_backend_cleanup] backend is NULL\n");
         return;
     }
-
-    if (backend->handle) {
-        pcap_close(backend->handle);
+    if (backend->running) {
+        printf("[pcap_backend_cleanup] backend running, call stop\n");
+        pcap_backend_stop(handle);
     }
-
-    free(backend->device);
-    free(backend->filter);
+    if (backend->filter) {
+        printf("[pcap_backend_cleanup] free filter %p\n", backend->filter);
+        free(backend->filter);
+        backend->filter = NULL;
+    }
+    printf("[pcap_backend_cleanup] free backend struct %p\n", backend);
     free(backend);
 }
 
@@ -196,18 +280,41 @@ int pcap_backend_get_stats(capture_handle_t* handle, capture_stats_t* stats) {
     if (!backend || !backend->handle || !stats) {
         return -1;
     }
-
-    struct pcap_stat pcap_stats;
-    if (pcap_stats(backend->handle, &pcap_stats) != 0) {
+    struct pcap_stat stat_info;
+    if (pcap_stats(backend->handle, &stat_info) != 0) {
         return -1;
     }
-
-    stats->packets_received = pcap_stats.ps_recv;
-    stats->packets_dropped = pcap_stats.ps_drop;
-    stats->packets_if_dropped = pcap_stats.ps_ifdrop;
-    stats->bytes_received = 0;  // TODO: 统计字节数
-
+    stats->packets_received = stat_info.ps_recv;
+    stats->packets_dropped = stat_info.ps_drop;
+    stats->packets_if_dropped = stat_info.ps_ifdrop;
     return 0;
+}
+
+const char* pcap_backend_get_version(void) {
+    return pcap_lib_version();
+}
+
+bool pcap_backend_is_feature_supported(const char* feature) {
+    // TODO: 实现功能检查
+    return false;
+}
+
+int pcap_backend_set_option(
+    capture_backend_t* backend,
+    const char* option,
+    const void* value
+) {
+    // TODO: 实现选项设置
+    return CAPTURE_ERROR_NOT_SUPPORTED;
+}
+
+int pcap_backend_get_option(
+    capture_backend_t* backend,
+    const char* option,
+    void* value
+) {
+    // TODO: 实现选项获取
+    return CAPTURE_ERROR_NOT_SUPPORTED;
 }
 
 // libpcap 后端私有数据
@@ -218,27 +325,8 @@ typedef struct {
     bool is_paused;                  // 是否暂停
     capture_stats_t stats;           // 统计信息
     struct timespec start_time;      // 开始时间
+    void* user_data;                 // 用户数据
 } pcap_backend_private_t;
-
-// 内部函数声明
-static int pcap_backend_init(void* backend, const capture_config_t* config);
-static void pcap_backend_cleanup(void* backend);
-static int pcap_backend_open(void* backend, const char* device);
-static int pcap_backend_close(void* backend);
-static int pcap_backend_start(void* backend, packet_callback_t callback, void* user_data);
-static int pcap_backend_stop(void* backend);
-static int pcap_backend_pause(void* backend);
-static int pcap_backend_resume(void* backend);
-static int pcap_backend_set_filter(void* backend, const char* filter);
-static int pcap_backend_get_stats(void* backend, capture_stats_t* stats);
-static int pcap_backend_get_devices(void* backend, capture_device_t** devices, int* count);
-static void pcap_backend_free_devices(void* backend, capture_device_t* devices, int count);
-static const char* pcap_backend_get_name(void* backend);
-static const char* pcap_backend_get_version(void* backend);
-static const char* pcap_backend_get_description(void* backend);
-static bool pcap_backend_is_feature_supported(void* backend, const char* feature);
-static int pcap_backend_set_option(void* backend, const char* option, const void* value);
-static int pcap_backend_get_option(void* backend, const char* option, void* value);
 
 // 操作函数表
 static capture_backend_ops_t pcap_backend_ops = {
@@ -248,9 +336,9 @@ static capture_backend_ops_t pcap_backend_ops = {
     .close = pcap_backend_close,
     .start = pcap_backend_start,
     .stop = pcap_backend_stop,
-    .pause = pcap_backend_pause,
-    .resume = pcap_backend_resume,
-    .set_filter = pcap_backend_set_filter,
+    .pause = NULL,
+    .resume = NULL,
+    .set_filter = NULL,
     .get_stats = pcap_backend_get_stats,
     .get_devices = pcap_backend_get_devices,
     .free_devices = pcap_backend_free_devices,
@@ -268,86 +356,138 @@ capture_backend_t* pcap_backend_create(
     error_callback_t error_cb,
     void* error_user_data
 ) {
+    printf("[pcap_backend_create] called, config=%p\n", config);
+    if (config) {
+        printf("[pcap_backend_create] device ptr=%p, filter ptr=%p\n", config->device, config->filter);
+        if (config->device) printf("[pcap_backend_create] device str=%s\n", config->device);
+        if (config->filter) printf("[pcap_backend_create] filter str=%s\n", config->filter);
+    }
     if (!config || !error_cb) {
         return NULL;
     }
 
     // 分配后端结构
-    capture_backend_t* backend = (capture_backend_t*)calloc(1, sizeof(capture_backend_t));
+    struct pcap_backend* backend = calloc(1, sizeof(struct pcap_backend));
+    printf("[pcap_backend_create] backend struct allocated at %p\n", backend);
     if (!backend) {
+        printf("[pcap_backend_create] backend allocation failed\n");
         return NULL;
     }
 
-    // 分配私有数据
-    pcap_backend_private_t* private_data = (pcap_backend_private_t*)calloc(1, sizeof(pcap_backend_private_t));
-    if (!private_data) {
+    // 初始化基础后端结构
+    backend->base.private_data = backend;
+    backend->base.ops = &pcap_backend_ops;
+    backend->base.type = CAPTURE_BACKEND_PCAP;
+    backend->base.error_cb = error_cb;
+    backend->base.error_user_data = error_user_data;
+
+    backend->device = strdup(config->device);
+    printf("[pcap_backend_create] backend->device strdup result: %p, str=%s\n", backend->device, backend->device);
+    backend->filter = config->filter ? strdup(config->filter) : NULL;
+    if (backend->filter) printf("[pcap_backend_create] backend->filter strdup result: %p, str=%s\n", backend->filter, backend->filter);
+
+    char errbuf[PCAP_ERRBUF_SIZE];
+    backend->handle = pcap_create(backend->device, errbuf);
+    if (!backend->handle) {
+        printf("[pcap_backend_create] pcap_create failed\n");
+        error_cb(errbuf, error_user_data);
+        free(backend->device);
+        free(backend->filter);
         free(backend);
         return NULL;
     }
 
-    // 初始化私有数据
-    memcpy(&private_data->config, config, sizeof(pcap_backend_config_t));
-    private_data->pcap = NULL;
-    private_data->is_running = false;
-    private_data->is_paused = false;
-    memset(&private_data->stats, 0, sizeof(capture_stats_t));
+    if (pcap_set_snaplen(backend->handle, backend->snaplen) != 0) {
+        printf("[pcap_backend_create] pcap_set_snaplen failed\n");
+        error_cb(pcap_geterr(backend->handle), error_user_data);
+        pcap_close(backend->handle);
+        free(backend->device);
+        free(backend->filter);
+        free(backend);
+        return NULL;
+    }
 
-    // 初始化后端结构
-    backend->private_data = private_data;
-    backend->ops = &pcap_backend_ops;
-    backend->type = CAPTURE_BACKEND_PCAP;
-    backend->error_cb = error_cb;
-    backend->error_user_data = error_user_data;
+    if (pcap_set_promisc(backend->handle, backend->promiscuous) != 0) {
+        printf("[pcap_backend_create] pcap_set_promisc failed\n");
+        error_cb(pcap_geterr(backend->handle), error_user_data);
+        pcap_close(backend->handle);
+        free(backend->device);
+        free(backend->filter);
+        free(backend);
+        return NULL;
+    }
 
-    return backend;
+    if (pcap_set_timeout(backend->handle, backend->timeout_ms) != 0) {
+        printf("[pcap_backend_create] pcap_set_timeout failed\n");
+        error_cb(pcap_geterr(backend->handle), error_user_data);
+        pcap_close(backend->handle);
+        free(backend->device);
+        free(backend->filter);
+        free(backend);
+        return NULL;
+    }
+
+    if (pcap_set_buffer_size(backend->handle, backend->buffer_size) != 0) {
+        error_cb(pcap_geterr(backend->handle), error_user_data);
+        pcap_close(backend->handle);
+        free(backend->device);
+        free(backend->filter);
+        free(backend);
+        return NULL;
+    }
+
+    if (pcap_activate(backend->handle) != 0) {
+        error_cb(pcap_geterr(backend->handle), error_user_data);
+        pcap_close(backend->handle);
+        free(backend->device);
+        free(backend->filter);
+        free(backend);
+        return NULL;
+    }
+
+    if (backend->filter) {
+        struct bpf_program fp;
+        if (pcap_compile(backend->handle, &fp, backend->filter, 0, PCAP_NETMASK_UNKNOWN) != 0) {
+            error_cb(pcap_geterr(backend->handle), error_user_data);
+            pcap_close(backend->handle);
+            free(backend->device);
+            free(backend->filter);
+            free(backend);
+            return NULL;
+        }
+
+        if (pcap_setfilter(backend->handle, &fp) != 0) {
+            error_cb(pcap_geterr(backend->handle), error_user_data);
+            pcap_freecode(&fp);
+            pcap_close(backend->handle);
+            free(backend->device);
+            free(backend->filter);
+            free(backend);
+            return NULL;
+        }
+
+        pcap_freecode(&fp);
+    }
+
+    printf("[pcap_backend_create] success, backend=%p\n", backend);
+    return (capture_backend_t*)backend;
 }
 
 // 销毁 libpcap 后端
 void pcap_backend_destroy(capture_backend_t* backend) {
+    printf("[pcap_backend_destroy] called, backend=%p\n", backend);
     if (!backend) {
+        printf("[pcap_backend_destroy] backend is NULL\n");
         return;
     }
 
-    pcap_backend_private_t* private_data = (pcap_backend_private_t*)backend->private_data;
-    if (private_data) {
-        if (private_data->pcap) {
-            pcap_close(private_data->pcap);
-        }
-        free(private_data);
+    struct pcap_backend* pcap_backend = (struct pcap_backend*)backend;
+    if (pcap_backend->handle) {
+        printf("[pcap_backend_destroy] closing pcap handle %p\n", pcap_backend->handle);
+        pcap_close(pcap_backend->handle);
     }
+    printf("[pcap_backend_destroy] freeing backend %p\n", backend);
     free(backend);
-}
-
-// 初始化后端
-static int pcap_backend_init(void* backend, const capture_config_t* config) {
-    if (!backend || !config) {
-        return CAPTURE_ERROR_INVALID_PARAM;
-    }
-
-    pcap_backend_private_t* private_data = (pcap_backend_private_t*)backend;
-    
-    // 更新配置
-    private_data->config.buffer_size = config->buffer_size;
-    private_data->config.timeout_ms = config->timeout_ms;
-    private_data->config.immediate = config->immediate;
-    private_data->config.promiscuous = config->promiscuous;
-    private_data->config.snaplen = config->snaplen;
-    private_data->config.filter = config->filter;
-    private_data->config.device = config->device;
-
-    return CAPTURE_SUCCESS;
-}
-
-// 清理后端
-static void pcap_backend_cleanup(void* backend) {
-    if (!backend) {
-        return;
-    }
-
-    pcap_backend_private_t* private_data = (pcap_backend_private_t*)backend;
-    if (private_data->pcap) {
-        pcap_close(private_data->pcap);
-    }
 }
 
 // 打开设备
@@ -426,181 +566,6 @@ static int pcap_backend_close(void* backend) {
         pcap_close(private_data->pcap);
         private_data->pcap = NULL;
     }
-
-    return CAPTURE_SUCCESS;
-}
-
-// 数据包回调包装函数
-static void pcap_packet_handler(u_char* user, const struct pcap_pkthdr* header, const u_char* packet) {
-    capture_backend_t* backend = (capture_backend_t*)user;
-    pcap_backend_private_t* private_data = (pcap_backend_private_t*)backend->private_data;
-    packet_callback_t callback = (packet_callback_t)private_data->user_data;
-
-    // 更新统计信息
-    private_data->stats.packets_received++;
-    private_data->stats.bytes_received += header->len;
-
-    // 构造数据包结构
-    packet_t pkt = {
-        .data = (uint8_t*)packet,
-        .len = header->len,
-        .caplen = header->caplen,
-        .ts = header->ts,
-        .if_index = 0,  // TODO: 获取接口索引
-        .flags = 0,
-        .protocol = 0,  // TODO: 解析协议类型
-        .vlan_tci = 0,
-        .hash = 0
-    };
-
-    // 调用用户回调
-    if (!callback(&pkt, private_data->user_data)) {
-        private_data->is_running = false;
-    }
-}
-
-// 开始抓包
-static int pcap_backend_start(void* backend, packet_callback_t callback, void* user_data) {
-    if (!backend || !callback) {
-        return CAPTURE_ERROR_INVALID_PARAM;
-    }
-
-    pcap_backend_private_t* private_data = (pcap_backend_private_t*)backend;
-    if (!private_data->pcap) {
-        return CAPTURE_ERROR_NOT_SUPPORTED;
-    }
-
-    if (private_data->is_running) {
-        return CAPTURE_SUCCESS;
-    }
-
-    // 保存回调信息
-    private_data->user_data = user_data;
-    private_data->is_running = true;
-    private_data->is_paused = false;
-
-    // 记录开始时间
-    clock_gettime(CLOCK_MONOTONIC, &private_data->start_time);
-    private_data->stats.start_time = private_data->start_time;
-
-    // 开始抓包
-    int ret = pcap_loop(private_data->pcap, -1, pcap_packet_handler, (u_char*)backend);
-    if (ret < 0) {
-        private_data->is_running = false;
-        if (ret == -2) {
-            return CAPTURE_SUCCESS;  // 正常停止
-        }
-        ((capture_backend_t*)backend)->error_cb(pcap_geterr(private_data->pcap), ((capture_backend_t*)backend)->error_user_data);
-        return CAPTURE_ERROR_BACKEND;
-    }
-
-    return CAPTURE_SUCCESS;
-}
-
-// 停止抓包
-static int pcap_backend_stop(void* backend) {
-    if (!backend) {
-        return CAPTURE_ERROR_INVALID_PARAM;
-    }
-
-    pcap_backend_private_t* private_data = (pcap_backend_private_t*)backend;
-    if (!private_data->pcap || !private_data->is_running) {
-        return CAPTURE_SUCCESS;
-    }
-
-    private_data->is_running = false;
-    pcap_breakloop(private_data->pcap);
-
-    // 记录结束时间
-    clock_gettime(CLOCK_MONOTONIC, &private_data->stats.end_time);
-
-    return CAPTURE_SUCCESS;
-}
-
-// 暂停抓包
-static int pcap_backend_pause(void* backend) {
-    if (!backend) {
-        return CAPTURE_ERROR_INVALID_PARAM;
-    }
-
-    pcap_backend_private_t* private_data = (pcap_backend_private_t*)backend;
-    if (!private_data->pcap || !private_data->is_running || private_data->is_paused) {
-        return CAPTURE_SUCCESS;
-    }
-
-    private_data->is_paused = true;
-    // TODO: 实现暂停功能
-
-    return CAPTURE_SUCCESS;
-}
-
-// 恢复抓包
-static int pcap_backend_resume(void* backend) {
-    if (!backend) {
-        return CAPTURE_ERROR_INVALID_PARAM;
-    }
-
-    pcap_backend_private_t* private_data = (pcap_backend_private_t*)backend;
-    if (!private_data->pcap || !private_data->is_running || !private_data->is_paused) {
-        return CAPTURE_SUCCESS;
-    }
-
-    private_data->is_paused = false;
-    // TODO: 实现恢复功能
-
-    return CAPTURE_SUCCESS;
-}
-
-// 设置过滤器
-static int pcap_backend_set_filter(void* backend, const char* filter) {
-    if (!backend || !filter) {
-        return CAPTURE_ERROR_INVALID_PARAM;
-    }
-
-    pcap_backend_private_t* private_data = (pcap_backend_private_t*)backend;
-    if (!private_data->pcap) {
-        return CAPTURE_ERROR_NOT_SUPPORTED;
-    }
-
-    struct bpf_program fp;
-    if (pcap_compile(private_data->pcap, &fp, filter, 0, PCAP_NETMASK_UNKNOWN) < 0) {
-        ((capture_backend_t*)backend)->error_cb(pcap_geterr(private_data->pcap), ((capture_backend_t*)backend)->error_user_data);
-        return CAPTURE_ERROR_SET_FILTER;
-    }
-
-    if (pcap_setfilter(private_data->pcap, &fp) < 0) {
-        pcap_freecode(&fp);
-        ((capture_backend_t*)backend)->error_cb(pcap_geterr(private_data->pcap), ((capture_backend_t*)backend)->error_user_data);
-        return CAPTURE_ERROR_SET_FILTER;
-    }
-
-    pcap_freecode(&fp);
-    return CAPTURE_SUCCESS;
-}
-
-// 获取统计信息
-static int pcap_backend_get_stats(void* backend, capture_stats_t* stats) {
-    if (!backend || !stats) {
-        return CAPTURE_ERROR_INVALID_PARAM;
-    }
-
-    pcap_backend_private_t* private_data = (pcap_backend_private_t*)backend;
-    if (!private_data->pcap) {
-        return CAPTURE_ERROR_NOT_SUPPORTED;
-    }
-
-    struct pcap_stat pcap_stats;
-    if (pcap_stats(private_data->pcap, &pcap_stats) < 0) {
-        ((capture_backend_t*)backend)->error_cb(pcap_geterr(private_data->pcap), ((capture_backend_t*)backend)->error_user_data);
-        return CAPTURE_ERROR_GET_STATS;
-    }
-
-    // 更新统计信息
-    private_data->stats.packets_dropped = pcap_stats.ps_drop;
-    private_data->stats.packets_if_dropped = pcap_stats.ps_ifdrop;
-
-    // 复制统计信息
-    memcpy(stats, &private_data->stats, sizeof(capture_stats_t));
 
     return CAPTURE_SUCCESS;
 }
@@ -685,42 +650,7 @@ static const char* pcap_backend_get_name(void* backend) {
     return "libpcap";
 }
 
-// 获取后端版本
-static const char* pcap_backend_get_version(void* backend) {
-    return pcap_lib_version();
-}
-
 // 获取后端描述
 static const char* pcap_backend_get_description(void* backend) {
     return "libpcap packet capture backend";
-}
-
-// 检查后端是否支持特定功能
-static bool pcap_backend_is_feature_supported(void* backend, const char* feature) {
-    if (!feature) {
-        return false;
-    }
-
-    // TODO: 实现功能检查
-    return false;
-}
-
-// 设置后端特定选项
-static int pcap_backend_set_option(void* backend, const char* option, const void* value) {
-    if (!backend || !option || !value) {
-        return CAPTURE_ERROR_INVALID_PARAM;
-    }
-
-    // TODO: 实现选项设置
-    return CAPTURE_ERROR_NOT_SUPPORTED;
-}
-
-// 获取后端特定选项
-static int pcap_backend_get_option(void* backend, const char* option, void* value) {
-    if (!backend || !option || !value) {
-        return CAPTURE_ERROR_INVALID_PARAM;
-    }
-
-    // TODO: 实现选项获取
-    return CAPTURE_ERROR_NOT_SUPPORTED;
 } 

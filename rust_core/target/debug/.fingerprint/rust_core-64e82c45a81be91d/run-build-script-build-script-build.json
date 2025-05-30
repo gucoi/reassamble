@@ -1,0 +1,1 @@
+{"rustc":2621711755960505754,"features":"","declared_features":"","target":0,"profile":0,"path":0,"deps":[[10798511653113900557,"build_script_build",false,3414681966794545848]],"local":[{"RerunIfChanged":{"output":"debug/build/rust_core-64e82c45a81be91d/output","paths":["../c_capture/include","../c_capture/src"]}}],"rustflags":[],"config":0,"compile_kind":0}
