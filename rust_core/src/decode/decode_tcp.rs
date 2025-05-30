@@ -2,9 +2,21 @@ use crate::SafePacket;
 use super::error::{DecodeError, DecodeResult, TcpHeaderError};
 use super::decode::{IpHeader, DecodedPacket, TransportProtocol};
 
+// TCP相关常量
+const MIN_TCP_SIZE: usize = 54;  // 以太网(14) + IP(20) + TCP(20)
+const TCP_HEADER_LENGTH_MASK: u8 = 0xF0;  // 用于获取TCP头部长度的掩码
+const TCP_HEADER_LENGTH_SHIFT: u8 = 4;    // TCP头部长度位移
+const TCP_HEADER_MIN_SIZE: u8 = 20;       // TCP头部最小大小
+const TCP_FLAGS_MASK: u8 = 0x3F;          // TCP标志掩码
+const TCP_PORT_OFFSET: usize = 0;         // TCP源端口偏移
+const TCP_DEST_PORT_OFFSET: usize = 2;    // TCP目标端口偏移
+const TCP_SEQ_OFFSET: usize = 4;          // TCP序列号偏移
+const TCP_ACK_OFFSET: usize = 8;          // TCP确认号偏移
+const TCP_FLAGS_OFFSET: usize = 13;       // TCP标志偏移
+const TCP_WINDOW_OFFSET: usize = 14;      // TCP窗口大小偏移
+
 /// 解码TCP包
 pub fn decode_tcp_packet(packet: &SafePacket, ip_header: &IpHeader) -> DecodeResult<DecodedPacket> {
-    const MIN_TCP_SIZE: usize = 54; // 以太网(14) + IP(20) + TCP(20)
     if packet.data.len() < MIN_TCP_SIZE {
         return Err(DecodeError::InsufficientLength {
             required: MIN_TCP_SIZE,
@@ -16,8 +28,8 @@ pub fn decode_tcp_packet(packet: &SafePacket, ip_header: &IpHeader) -> DecodeRes
     let tcp_offset = 14 + ip_header_len as usize;
 
     // 获取TCP头部长度
-    let tcp_header_len = ((packet.data[tcp_offset + 12] >> 4) & 0xF) * 4;
-    if tcp_header_len < 20 {
+    let tcp_header_len = ((packet.data[tcp_offset + 12] & TCP_HEADER_LENGTH_MASK) >> TCP_HEADER_LENGTH_SHIFT) * 4;
+    if tcp_header_len < TCP_HEADER_MIN_SIZE {
         return Err(TcpHeaderError::InvalidHeaderLength { length: tcp_header_len }.into());
     }
 
@@ -30,15 +42,15 @@ pub fn decode_tcp_packet(packet: &SafePacket, ip_header: &IpHeader) -> DecodeRes
     }
 
     // 验证端口号
-    let src_port = u16::from_be_bytes([packet.data[tcp_offset], packet.data[tcp_offset + 1]]);
-    let dst_port = u16::from_be_bytes([packet.data[tcp_offset + 2], packet.data[tcp_offset + 3]]);
+    let src_port = u16::from_be_bytes([packet.data[tcp_offset + TCP_PORT_OFFSET], packet.data[tcp_offset + TCP_PORT_OFFSET + 1]]);
+    let dst_port = u16::from_be_bytes([packet.data[tcp_offset + TCP_DEST_PORT_OFFSET], packet.data[tcp_offset + TCP_DEST_PORT_OFFSET + 1]]);
     if src_port == 0 || dst_port == 0 {
         return Err(TcpHeaderError::InvalidPort { port: if src_port == 0 { src_port } else { dst_port } }.into());
     }
 
     // 验证TCP标志
-    let flags = packet.data[tcp_offset + 13];
-    if flags & 0x3F == 0 {
+    let flags = packet.data[tcp_offset + TCP_FLAGS_OFFSET];
+    if flags & TCP_FLAGS_MASK == 0 {
         return Err(TcpHeaderError::InvalidFlags { flags }.into());
     }
 
@@ -50,23 +62,26 @@ pub fn decode_tcp_packet(packet: &SafePacket, ip_header: &IpHeader) -> DecodeRes
         ip_header: ip_header.clone(),
         src_port,
         dst_port,
-        protocol: TransportProtocol::Tcp {
+        protocol: TransportProtocol::TCP {
             seq: u32::from_be_bytes([
-                packet.data[tcp_offset + 4],
-                packet.data[tcp_offset + 5],
-                packet.data[tcp_offset + 6],
-                packet.data[tcp_offset + 7],
+                packet.data[tcp_offset + TCP_SEQ_OFFSET],
+                packet.data[tcp_offset + TCP_SEQ_OFFSET + 1],
+                packet.data[tcp_offset + TCP_SEQ_OFFSET + 2],
+                packet.data[tcp_offset + TCP_SEQ_OFFSET + 3],
             ]),
             ack: u32::from_be_bytes([
-                packet.data[tcp_offset + 8],
-                packet.data[tcp_offset + 9],
-                packet.data[tcp_offset + 10],
-                packet.data[tcp_offset + 11],
+                packet.data[tcp_offset + TCP_ACK_OFFSET],
+                packet.data[tcp_offset + TCP_ACK_OFFSET + 1],
+                packet.data[tcp_offset + TCP_ACK_OFFSET + 2],
+                packet.data[tcp_offset + TCP_ACK_OFFSET + 3],
             ]),
             flags,
-            window: u16::from_be_bytes([packet.data[tcp_offset + 14], packet.data[tcp_offset + 15]]),
+            window: u16::from_be_bytes([
+                packet.data[tcp_offset + TCP_WINDOW_OFFSET],
+                packet.data[tcp_offset + TCP_WINDOW_OFFSET + 1],
+            ]),
         },
-        payload,
+        payload: payload.into(),
     })
 }
 
@@ -76,7 +91,6 @@ pub fn decode_tcp_packet_with_buffer(
     buffer: &[u8],
     ip_header: &IpHeader,
 ) -> DecodeResult<DecodedPacket> {
-    const MIN_TCP_SIZE: usize = 54; // 以太网(14) + IP(20) + TCP(20)
     if buffer.len() < MIN_TCP_SIZE {
         return Err(DecodeError::InsufficientLength {
             required: MIN_TCP_SIZE,
@@ -88,8 +102,8 @@ pub fn decode_tcp_packet_with_buffer(
     let tcp_offset = 14 + ip_header_len as usize;
 
     // 获取TCP头部长度
-    let tcp_header_len = ((buffer[tcp_offset + 12] >> 4) & 0xF) * 4;
-    if tcp_header_len < 20 {
+    let tcp_header_len = ((buffer[tcp_offset + 12] & TCP_HEADER_LENGTH_MASK) >> TCP_HEADER_LENGTH_SHIFT) * 4;
+    if tcp_header_len < TCP_HEADER_MIN_SIZE {
         return Err(TcpHeaderError::InvalidHeaderLength { length: tcp_header_len }.into());
     }
 
@@ -102,15 +116,15 @@ pub fn decode_tcp_packet_with_buffer(
     }
 
     // 验证端口号
-    let src_port = u16::from_be_bytes([buffer[tcp_offset], buffer[tcp_offset + 1]]);
-    let dst_port = u16::from_be_bytes([buffer[tcp_offset + 2], buffer[tcp_offset + 3]]);
+    let src_port = u16::from_be_bytes([buffer[tcp_offset + TCP_PORT_OFFSET], buffer[tcp_offset + TCP_PORT_OFFSET + 1]]);
+    let dst_port = u16::from_be_bytes([buffer[tcp_offset + TCP_DEST_PORT_OFFSET], buffer[tcp_offset + TCP_DEST_PORT_OFFSET + 1]]);
     if src_port == 0 || dst_port == 0 {
         return Err(TcpHeaderError::InvalidPort { port: if src_port == 0 { src_port } else { dst_port } }.into());
     }
 
     // 验证TCP标志
-    let flags = buffer[tcp_offset + 13];
-    if flags & 0x3F == 0 {
+    let flags = buffer[tcp_offset + TCP_FLAGS_OFFSET];
+    if flags & TCP_FLAGS_MASK == 0 {
         return Err(TcpHeaderError::InvalidFlags { flags }.into());
     }
 
@@ -123,23 +137,26 @@ pub fn decode_tcp_packet_with_buffer(
         ip_header: ip_header.clone(),
         src_port,
         dst_port,
-        protocol: TransportProtocol::Tcp {
+        protocol: TransportProtocol::TCP {
             seq: u32::from_be_bytes([
-                buffer[tcp_offset + 4],
-                buffer[tcp_offset + 5],
-                buffer[tcp_offset + 6],
-                buffer[tcp_offset + 7],
+                buffer[tcp_offset + TCP_SEQ_OFFSET],
+                buffer[tcp_offset + TCP_SEQ_OFFSET + 1],
+                buffer[tcp_offset + TCP_SEQ_OFFSET + 2],
+                buffer[tcp_offset + TCP_SEQ_OFFSET + 3],
             ]),
             ack: u32::from_be_bytes([
-                buffer[tcp_offset + 8],
-                buffer[tcp_offset + 9],
-                buffer[tcp_offset + 10],
-                buffer[tcp_offset + 11],
+                buffer[tcp_offset + TCP_ACK_OFFSET],
+                buffer[tcp_offset + TCP_ACK_OFFSET + 1],
+                buffer[tcp_offset + TCP_ACK_OFFSET + 2],
+                buffer[tcp_offset + TCP_ACK_OFFSET + 3],
             ]),
             flags,
-            window: u16::from_be_bytes([buffer[tcp_offset + 14], buffer[tcp_offset + 15]]),
+            window: u16::from_be_bytes([
+                buffer[tcp_offset + TCP_WINDOW_OFFSET],
+                buffer[tcp_offset + TCP_WINDOW_OFFSET + 1],
+            ]),
         },
-        payload,
+        payload: payload.into(),
     })
 }
 

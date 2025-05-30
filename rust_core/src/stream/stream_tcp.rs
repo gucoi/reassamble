@@ -4,9 +4,10 @@ use super::super::decode::DecodedPacket;
 use parking_lot::RwLock;  // 使用 parking_lot 提供的更高效的读写锁
 use dashmap::DashMap;     // 使用 DashMap 替代 HashMap
 use std::sync::Arc;
-use dashmap::mapref::entry::Entry;
 use super::super::stream::StreamStats;
 use crate::decode::TransportProtocol;
+use crate::memory::MemoryBlock;
+use bytes::BytesMut;
 
 pub const TCP_FIN: u8 = 0x01;
 pub const TCP_SYN: u8 = 0x02;
@@ -29,13 +30,13 @@ pub enum TcpState {
     Closed,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct SackBlock {
     start_seq: u32,
     end_seq: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ReassemblyError {
     InvalidSequence(u32),
     GapTooLarge(u32),
@@ -71,13 +72,37 @@ struct TcpStream {
     total_bytes: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TcpSegment {
     seq: u32,
-    data: Box<[u8]>,
+    data: MemoryBlock,
     received: Instant,
     retransmit_count: u8,
     last_retransmit: Option<Instant>,
+}
+
+impl TcpSegment {
+    fn new(seq: u32, data: BytesMut, received: Instant) -> Self {
+        let mut block = MemoryBlock::new(data.len());
+        {
+            let mut block_data = block.lock();
+            block_data.extend_from_slice(&data);
+        }
+        
+        Self {
+            seq,
+            data: block,
+            received,
+            retransmit_count: 0,
+            last_retransmit: None,
+        }
+    }
+}
+
+impl Drop for TcpSegment {
+    fn drop(&mut self) {
+        self.data.mark_free();
+    }
 }
 
 pub struct TcpReassembler {
@@ -102,10 +127,13 @@ impl TcpReassembler {
     }
 
     pub fn process_packet(&self, packet: &DecodedPacket) -> Option<Vec<u8>> {
-        println!("[process_packet][ENTER] called, src_ip: {}, src_port: {}, dst_ip: {}, dst_port: {}, payload_len: {}", packet.ip_header.src_ip, packet.src_port, packet.ip_header.dst_ip, packet.dst_port, packet.payload.len());
-        println!("[process_packet][ENTER] backtrace: {:?}", std::backtrace::Backtrace::capture());
+        log::debug!("处理数据包: src_ip={}, src_port={}, dst_ip={}, dst_port={}, payload_len={}", 
+            packet.ip_header.source_ip, packet.src_port, 
+            packet.ip_header.dest_ip, packet.dst_port, 
+            packet.payload.len());
+
         let (seq, ack, flags, window) = match &packet.protocol {
-            TransportProtocol::Tcp { seq, ack, flags, window } => {
+            TransportProtocol::TCP { seq, ack, flags, window } => {
                 (*seq, *ack, *flags, *window)
             }
             _ => return None,
@@ -114,26 +142,43 @@ impl TcpReassembler {
         let now = Instant::now();
         
         let stream_key = format!("{}:{}-{}:{}:{}", 
-            packet.ip_header.src_ip, packet.src_port,
-            packet.ip_header.dst_ip, packet.dst_port,
+            packet.ip_header.source_ip, packet.src_port,
+            packet.ip_header.dest_ip, packet.dst_port,
             if packet.src_port < packet.dst_port { "forward" } else { "reverse" }
         );
 
-        println!("[process_packet] stream_key: {} seq: {} ack: {} flags: {} payload_len: {}", stream_key, seq, ack, flags, packet.payload.len());
+        log::debug!("流标识: {}, seq={}, ack={}, flags={}, payload_len={}", 
+            stream_key, seq, ack, flags, packet.payload.len());
 
         // 检查是否是重传包
         if let Some(stream) = self.streams.get(&stream_key) {
             let mut stream_guard = stream.write();
-            println!("[process_packet] EXISTING stream, seq: {}, segments_len: {}", seq, stream_guard.segments.len());
+            
+            // 添加状态超时检查
+            self.check_state_timeout(&mut stream_guard, now);
+            
+            log::debug!("处理已存在的流, seq={}, segments_len={}", seq, stream_guard.segments.len());
+            
             // 如果是重传包，更新统计信息并返回 None
             if !packet.payload.is_empty() {
-                if let Some(existing_segment) = stream_guard.segments.get(&seq) {
-                    if existing_segment.data == packet.payload.clone().into_boxed_slice() {
-                        stream_guard.stats.retransmissions += 1;
-                        self.update_stats(StreamEvent::Retransmission, &mut stream_guard);
-                        println!("[process_packet] retransmission detected, seq: {}", seq);
-                        return None;
+                let is_retransmission = {
+                    if let Some(existing_segment) = stream_guard.segments.get(&seq) {
+                        let existing_data = existing_segment.data.lock();
+                        existing_data.as_ref() == &packet.payload
+                    } else {
+                        false
                     }
+                };
+
+                if is_retransmission {
+                    stream_guard.stats.retransmissions += 1;
+                    self.update_stats(StreamEvent::Retransmission, &mut stream_guard);
+                    // 更新全局统计信息
+                    if let Some(mut stats) = self.stream_stats.get_mut(&stream_key) {
+                        stats.retransmissions += 1;
+                    }
+                    log::debug!("检测到重传包, seq={}", seq);
+                    return None;
                 }
             }
             
@@ -142,25 +187,29 @@ impl TcpReassembler {
             
             if !packet.payload.is_empty() {
                 let packet_seq = match packet.protocol {
-                    TransportProtocol::Tcp { seq, .. } => seq,
+                    TransportProtocol::TCP { seq, .. } => seq,
                     _ => 0,
                 };
                 // 新增：如果新包 seq 小于当前 seq，统计乱序
                 if packet_seq < stream_guard.seq {
                     stream_guard.stats.out_of_order += 1;
                     self.update_stats(StreamEvent::OutOfOrder, &mut stream_guard);
+                    // 更新全局统计信息
+                    if let Some(mut stats) = self.stream_stats.get_mut(&stream_key) {
+                        stats.out_of_order += 1;
+                    }
                 }
                 self.add_segment(&mut stream_guard, packet, now);
                 if let Some((&min_seq, _)) = stream_guard.segments.iter().next() {
                     stream_guard.seq = min_seq;
                 }
-                println!("[process_packet] after add_segment, segments_len: {}", stream_guard.segments.len());
+                log::debug!("添加段后, segments_len={}", stream_guard.segments.len());
             }
             
-            println!("[process_packet] segments key: {:?}", stream_guard.segments.keys().collect::<Vec<_>>());
+            log::debug!("当前段序列号: {:?}", stream_guard.segments.keys().collect::<Vec<_>>());
             self.handle_tcp_flags(&mut stream_guard, packet);
             let result = self.try_reassemble(&mut stream_guard);
-            println!("[process_packet] try_reassemble result: {:?}", result.as_ref().map(|v| v.len()));
+            log::debug!("重组结果长度: {:?}", result.as_ref().map(|v| v.len()));
             return result;
         } else {
             // 新流
@@ -173,7 +222,7 @@ impl TcpReassembler {
                 segments: BTreeMap::new(),
                 last_ack: ack,
                 last_seen: now,
-                state: TcpState::Closed,
+                state: TcpState::SynSent,
                 isn: seq,
                 fin_seq: None,
                 sack_blocks: std::array::from_fn(|_| SackBlock { start_seq: 0, end_seq: 0 }),
@@ -183,13 +232,16 @@ impl TcpReassembler {
                 total_bytes: 0,
             }));
 
+            // 为新流创建统计信息
+            self.stream_stats.insert(stream_key.clone(), StreamStats::default());
+
             if !packet.payload.is_empty() {
                 let mut stream = new_stream.write();
                 self.add_segment(&mut stream, packet, now);
                 if let Some((&min_seq, _)) = stream.segments.iter().next() {
                     stream.seq = min_seq;
                 }
-                println!("[process_packet] NEW stream, after add_segment, segments_len: {}", stream.segments.len());
+                log::debug!("新流添加段后, segments_len={}", stream.segments.len());
             }
             
             self.streams.insert(stream_key, new_stream);
@@ -198,13 +250,15 @@ impl TcpReassembler {
     }
 
     fn try_reassemble(&self, stream: &mut TcpStream) -> Option<Vec<u8>> {
-        println!("[try_reassemble][ENTER] called, stream.seq: {}, segments: {:?}", stream.seq, stream.segments.keys().collect::<Vec<_>>());
+        log::debug!("尝试重组, stream.seq={}, segments={:?}", 
+            stream.seq, stream.segments.keys().collect::<Vec<_>>());
+            
         if stream.segments.is_empty() {
-            println!("[try_reassemble] segments empty, return None");
+            log::debug!("段为空，返回 None");
             return None;
         }
 
-        println!("[try_reassemble] 当前 segments key: {:?}, seq: {}, total_bytes: {}", 
+        log::debug!("当前段序列号: {:?}, seq={}, total_bytes={}", 
             stream.segments.keys().collect::<Vec<_>>(), 
             stream.seq, 
             stream.total_bytes);
@@ -215,32 +269,40 @@ impl TcpReassembler {
 
         // 获取第一个段的序列号
         if let Some((&first_seq, _)) = stream.segments.iter().next() {
-            println!("[try_reassemble] first_seq: {}, next_seq: {}", first_seq, next_seq);
+            log::debug!("first_seq={}, next_seq={}", first_seq, next_seq);
             
-            // 如果第一个段不是期望的序列号，标记为乱序
+            // 如果第一个段不是期望的序列号，检查是否在 SACK 块中
             if first_seq != next_seq {
-                println!("[try_reassemble] out_of_order detected: first_seq={}, next_seq={}", first_seq, next_seq);
-                out_of_order = true;
-                stream.stats.out_of_order += 1;
-                return None;
+                if !stream.is_seq_sacked(first_seq) {
+                    log::warn!("检测到乱序: first_seq={}, next_seq={}", first_seq, next_seq);
+                    out_of_order = true;
+                    stream.stats.out_of_order += 1;
+                    self.update_stats(StreamEvent::OutOfOrder, stream);
+                    return None;
+                }
             }
 
             // 使用 BTreeMap 的有序特性，按顺序处理段
             let mut current_seq = next_seq;
             while let Some((&seq, _)) = stream.segments.first_key_value() {
-                if seq != current_seq {
-                    println!("[try_reassemble][BREAK] sequence mismatch: seq={}, current_seq={}", seq, current_seq);
+                if seq != current_seq && !stream.is_seq_sacked(seq) {
+                    log::warn!("序列号不匹配: seq={}, current_seq={}", seq, current_seq);
+                    let gap_size = seq - current_seq;
+                    if gap_size > self.max_gap {
+                        self.handle_error(ReassemblyError::GapTooLarge(gap_size), stream);
+                    }
                     break;
                 }
 
                 if let Some(seg) = stream.segments.remove(&seq) {
-                    println!("[try_reassemble][REMOVE] removed segment seq: {}, data_len: {}", 
-                        seg.seq, seg.data.len());
-                    reassembled.extend(&seg.data);
-                    current_seq += seg.data.len() as u32;
-                    stream.total_bytes -= seg.data.len() as u32;
+                    log::debug!("移除段: seq={}, data_len={}", seg.seq, seg.data.len());
+                    let data = seg.data.lock();
+                    reassembled.extend_from_slice(data.as_ref());
+                    current_seq += data.len() as u32;
+                    stream.total_bytes -= data.len() as u32;
                 } else {
-                    println!("[try_reassemble][ERROR] segment not found for seq: {}! break.", seq);
+                    log::error!("未找到段: seq={}", seq);
+                    self.handle_error(ReassemblyError::InvalidSequence(seq), stream);
                     break;
                 }
             }
@@ -253,31 +315,57 @@ impl TcpReassembler {
         });
 
         if !reassembled.is_empty() {
-            println!("[try_reassemble][RETURN SOME] reassembled.len: {}", reassembled.len());
+            log::debug!("重组完成, 长度={}", reassembled.len());
             stream.seq = next_seq + reassembled.len() as u32;
             stream.stats.byte_count += reassembled.len() as u64;
             self.update_stats(StreamEvent::SegmentReassembled, stream);
             Some(reassembled)
         } else {
-            println!("[try_reassemble] reassembled empty, return None");
+            log::debug!("重组结果为空");
             None
         }
     }
 
     fn add_segment(&self, stream: &mut TcpStream, packet: &DecodedPacket, now: Instant) {
         let new_bytes = packet.payload.len() as u32;
-        if stream.total_bytes + new_bytes > 10_000_000 { // 10MB 阈值
-            // 清理最老段或拒绝新段
+        
+        // 检查窗口大小限制
+        if stream.window_size > 0 && new_bytes > stream.window_size {
+            self.handle_error(ReassemblyError::GapTooLarge(new_bytes), stream);
             return;
         }
+        
+        if stream.total_bytes + new_bytes > 10_000_000 { // 10MB 阈值
+            self.handle_error(ReassemblyError::GapTooLarge(new_bytes), stream);
+            return;
+        }
+        
         let seq = match packet.protocol {
-            TransportProtocol::Tcp { seq, .. } => seq,
+            TransportProtocol::TCP { seq, .. } => seq,
             _ => return,
         };
-        if stream.segments.contains_key(&seq) {
-            println!("[add_segment] WARNING: segment with seq {} already exists!", seq);
+        
+        // 检查序列号是否有效
+        if !is_seq_after(seq, stream.seq) && seq != stream.seq {
+            self.handle_error(ReassemblyError::InvalidSequence(seq), stream);
+            return;
         }
+        
+        if stream.segments.contains_key(&seq) {
+            log::warn!("段已存在: seq={}", seq);
+            self.handle_error(ReassemblyError::SegmentOverlap { 
+                existing: seq, 
+                new: seq 
+            }, stream);
+            return;
+        }
+        
         stream.total_bytes += new_bytes;
+        
+        // 检查段大小是否超过 MSS
+        if new_bytes > stream.mss as u32 {
+            log::warn!("段大小超过 MSS: size={}, mss={}", new_bytes, stream.mss);
+        }
         
         if stream.segments.len() >= self.max_segments {
             if let Some((&oldest_seq, _)) = stream.segments.iter()
@@ -285,21 +373,48 @@ impl TcpReassembler {
                 stream.segments.remove(&oldest_seq);
             }
         }
-        stream.segments.insert(seq, TcpSegment {
-            seq: seq,
-            data: packet.payload.clone().into_boxed_slice(),
-            received: now,
-            retransmit_count: 0,
-            last_retransmit: None,
-        });
+        
+        let segment = TcpSegment::new(seq, packet.payload.clone(), now);
+        stream.segments.insert(seq, segment);
+        
+        // 添加新段事件
+        self.update_stats(StreamEvent::NewSegment, stream);
+        
+        // 检查是否有间隙
+        if let Some((&next_seq, _)) = stream.segments.iter().next() {
+            if next_seq > stream.seq + 1 {
+                let gap_size = next_seq - stream.seq;
+                if gap_size > self.max_gap {
+                    self.handle_error(ReassemblyError::GapTooLarge(gap_size), stream);
+                } else {
+                    self.update_stats(StreamEvent::GapDetected, stream);
+                }
+            }
+        }
     }
 
     pub fn cleanup_expired(&self, now: Instant) {
         let mut expired_keys = Vec::new();
         self.streams.iter().for_each(|ref_multi| {
-            let stream_guard = ref_multi.value().read();
+            let mut stream_guard = ref_multi.value().write();
             if stream_guard.last_seen + self.timeout <= now {
                 expired_keys.push(ref_multi.key().clone());
+                // 清理过期的统计信息
+                self.stream_stats.remove(ref_multi.key());
+            } else {
+                // 清理过期的段
+                stream_guard.segments.retain(|_, seg| {
+                    // 如果段被重传超过3次，或者最后一次重传超过30秒，则删除
+                    if seg.retransmit_count > 3 {
+                        return false;
+                    }
+                    if let Some(last_retransmit) = seg.last_retransmit {
+                        if now.duration_since(last_retransmit) > Duration::from_secs(30) {
+                            return false;
+                        }
+                    }
+                    now.duration_since(seg.received) <= self.timeout
+                });
             }
         });
         for key in expired_keys {
@@ -324,9 +439,27 @@ impl TcpReassembler {
         }
     }
 
+    fn check_state_timeout(&self, stream: &mut TcpStream, now: Instant) {
+        match stream.state {
+            TcpState::FinWait2 => {
+                if now - stream.last_seen > Duration::from_secs(60) {
+                    stream.state = TcpState::Closed;
+                    self.update_stats(StreamEvent::StreamClosed, stream);
+                }
+            }
+            TcpState::TimeWait => {
+                if now - stream.last_seen > Duration::from_secs(2 * 60) { // 2MSL
+                    stream.state = TcpState::Closed;
+                    self.update_stats(StreamEvent::StreamClosed, stream);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn handle_tcp_flags(&self, stream: &mut TcpStream, packet: &DecodedPacket) {
-        let (seq, tcp_flags , ack) = match &packet.protocol {
-            TransportProtocol::Tcp { flags, seq ,ack,..} => (*seq, *flags, *ack),
+        let (seq, tcp_flags, ack) = match &packet.protocol {
+            TransportProtocol::TCP { flags, seq, ack, .. } => (*seq, *flags, *ack),
             _ => return,
         };
 
@@ -334,17 +467,16 @@ impl TcpReassembler {
         
         match stream.state {
             TcpState::Closed => {
-                if let TransportProtocol::Tcp { flags, .. } = packet.protocol {
-                    if flags & TCP_SYN != 0 {
+                if flags & TCP_SYN != 0 {
                     stream.state = TcpState::SynReceived;
                 } else {
                     self.handle_error(ReassemblyError::InvalidState(stream.state), stream);
-                    }
                 }
             }
             TcpState::SynSent => {
-                if flags & TCP_SYN != 0 {
-                    stream.state = TcpState::SynReceived;
+                if flags & TCP_SYN != 0 && flags & TCP_ACK != 0 {
+                    stream.state = TcpState::Established;
+                    self.update_stats(StreamEvent::StreamEstablished, stream);
                 } else {
                     self.handle_error(ReassemblyError::InvalidState(stream.state), stream);
                 }
@@ -359,6 +491,17 @@ impl TcpReassembler {
             }
             TcpState::Established => {
                 if flags & TCP_FIN != 0 {
+                    // 收到对方的 FIN，进入 CloseWait 状态
+                    stream.state = TcpState::CloseWait;
+                    stream.fin_seq = Some(seq);
+                    // 验证 FIN 序列号
+                    if let Some(fin_seq) = stream.fin_seq {
+                        if fin_seq != seq {
+                            log::warn!("WARNING: FIN sequence number mismatch: expected {}, got {}", fin_seq, seq);
+                        }
+                    }
+                } else if flags & TCP_ACK != 0 {
+                    // 主动关闭连接
                     stream.state = TcpState::FinWait1;
                 }
             }
@@ -369,23 +512,44 @@ impl TcpReassembler {
             }
             TcpState::FinWait2 => {
                 if flags & TCP_FIN != 0 {
+                    stream.state = TcpState::Closing;
+                    // 验证 FIN 序列号
+                    if let Some(fin_seq) = stream.fin_seq {
+                        if fin_seq != seq {
+                            log::warn!("WARNING: FIN sequence number mismatch: expected {}, got {}", fin_seq, seq);
+                        }
+                    }
+                }
+            }
+            TcpState::CloseWait => {
+                // 在 CloseWait 状态下，如果本地应用发送了 FIN，则进入 LastAck 状态
+                if flags & TCP_FIN != 0 {
                     stream.state = TcpState::LastAck;
                 }
             }
+            TcpState::Closing => {
+                if flags & TCP_ACK != 0 {
+                    stream.state = TcpState::TimeWait;
+                }
+            }
             TcpState::LastAck => {
-                if flags & TCP_FIN != 0 {
+                if flags & TCP_ACK != 0 {
                     stream.state = TcpState::Closed;
                     self.update_stats(StreamEvent::StreamClosed, stream);
                 }
             }
-            _ => {
-                self.handle_error(ReassemblyError::InvalidState(stream.state), stream);
+            TcpState::TimeWait => {
+                // TimeWait 状态由超时检查处理
             }
         }
         
         // ACK 处理
         if flags & TCP_ACK != 0 {
             stream.last_ack = ack;
+            // 更新窗口大小
+            if let TransportProtocol::TCP { window, .. } = packet.protocol {
+                stream.window_size = window as u32;
+            }
         }
         
         // RST 处理
@@ -397,28 +561,58 @@ impl TcpReassembler {
 
     fn handle_retransmission(&self, stream: &mut TcpStream, packet: &DecodedPacket) {
         let seq = match packet.protocol {
-            TransportProtocol::Tcp { seq, .. } => seq,
+            TransportProtocol::TCP { seq, .. } => seq,
             _ => return,
         };
 
         // 检查是否是重传
-        if let Some(existing_segment) = stream.segments.get(&seq) {
-            if existing_segment.data == packet.payload.clone().into_boxed_slice() {
-                // 更新重传统计
-                stream.stats.retransmissions += 1;
-                self.update_stats(StreamEvent::Retransmission, stream);
-                return; // 重传包直接返回，不进行重组
+        let is_retransmission = {
+            if let Some(existing_segment) = stream.segments.get(&seq) {
+                let existing_data = existing_segment.data.lock();
+                existing_data.as_ref() == &packet.payload
+            } else {
+                false
             }
+        };
+
+        if is_retransmission {
+            // 更新重传计数和时间
+            if let Some(segment) = stream.segments.remove(&seq) {
+                let mut updated_segment = segment;
+                updated_segment.retransmit_count += 1;
+                updated_segment.last_retransmit = Some(Instant::now());
+                stream.segments.insert(seq, updated_segment);
+            }
+            
+            stream.stats.retransmissions += 1;
+            self.update_stats(StreamEvent::Retransmission, stream);
         }
     }
 
     fn handle_sack(&self, stream: &mut TcpStream, sack_blocks: &[SackBlock]) {
-        for block in sack_blocks {
-            // 处理 SACK 信息，可以用来优化重传决策
-            stream.segments.retain(|&seq, _| 
-                seq < block.start_seq || seq >= block.end_seq
-            );
+        for &block in sack_blocks {
+            if block.start_seq != 0 && block.end_seq != 0 {
+                stream.update_sack_blocks(block);
+            }
         }
+
+        // 使用 SACK 信息优化段管理
+        let sacked_seqs: Vec<u32> = stream.segments.keys()
+            .filter(|&&seq| stream.is_seq_sacked(seq))
+            .cloned()
+            .collect();
+            
+        for seq in sacked_seqs {
+            if let Some(seg) = stream.segments.remove(&seq) {
+                // 如果段在 SACK 块内，保留它
+                stream.segments.insert(seq, seg);
+            }
+        }
+        
+        // 删除已确认的段
+        stream.segments.retain(|&seq, _| {
+            seq >= stream.last_ack
+        });
     }
 
     pub fn get_stats (&self) -> StreamStats {
@@ -440,15 +634,38 @@ impl TcpReassembler {
 
     fn update_stats(&self, event: StreamEvent, stream: &mut TcpStream) {
         match event {
-            StreamEvent::Retransmission => stream.stats.retransmissions += 1,
-            StreamEvent::GapDetected => stream.stats.gaps_detected += 1,
-            StreamEvent::NewSegment => stream.stats.packet_count += 1,
-            StreamEvent::StreamEstablished => stream.stats.packet_count += 1,
-            StreamEvent::StreamClosed => stream.stats.packet_count += 1,
-            StreamEvent::SegmentReassembled => stream.stats.byte_count += 1,
-            StreamEvent::OutOfOrder => stream.stats.out_of_order += 1,
-            StreamEvent::Error(error) => self.handle_error(error, stream),
-            _ => {}
+            StreamEvent::Retransmission => {
+                stream.stats.retransmissions += 1;
+                log::info!("检测到重传包");
+            }
+            StreamEvent::GapDetected => {
+                stream.stats.gaps_detected += 1;
+                log::info!("检测到数据间隙");
+            }
+            StreamEvent::NewSegment => {
+                stream.stats.packet_count += 1;
+                log::info!("收到新数据段");
+            }
+            StreamEvent::StreamEstablished => {
+                stream.stats.packet_count += 1;
+                log::info!("TCP 连接已建立");
+            }
+            StreamEvent::StreamClosed => {
+                stream.stats.packet_count += 1;
+                log::info!("TCP 连接已关闭");
+            }
+            StreamEvent::SegmentReassembled => {
+                stream.stats.byte_count += 1;
+                log::info!("数据段重组完成");
+            }
+            StreamEvent::OutOfOrder => {
+                stream.stats.out_of_order += 1;
+                log::info!("检测到乱序包");
+            }
+            StreamEvent::Error(error) => {
+                log::error!("重组错误: {:?}", error);
+                self.handle_error(error, stream);
+            }
         }
     }
 
@@ -456,16 +673,16 @@ impl TcpReassembler {
         stream.stats.reassambled_errors += 1;
         match error {
             ReassemblyError::InvalidSequence(seq) => {
-                log::warn!("Invalid sequence number detected: {}", seq);
+                log::warn!("无效的序列号: {}", seq);
             }
             ReassemblyError::GapTooLarge(size) => {
-                log::warn!("Gap too large: {} bytes", size);
+                log::warn!("数据间隙过大: {} 字节", size);
             }
             ReassemblyError::SegmentOverlap { existing, new } => {
-                log::warn!("Segment overlap detected: existing={}, new={}", existing, new);
+                log::warn!("数据段重叠: 现有序列号={}, 新序列号={}", existing, new);
             }
             ReassemblyError::InvalidState(state) => {
-                log::warn!("Invalid TCP state transition: {:?}", state);
+                log::warn!("无效的 TCP 状态转换: {:?}", state);
             }
         }
     }
@@ -495,6 +712,51 @@ impl TcpReassembler {
 
 }
 
+impl TcpStream {
+    // 添加新方法
+    fn update_sack_blocks(&mut self, new_block: SackBlock) {
+        // 清理过期的 SACK 块
+        self.cleanup_sack_blocks();
+        
+        // 尝试合并相邻的 SACK 块
+        for i in 0..self.sack_blocks.len() {
+            if self.sack_blocks[i].start_seq == 0 && self.sack_blocks[i].end_seq == 0 {
+                // 找到空槽位，直接插入
+                self.sack_blocks[i] = new_block;
+                return;
+            }
+            
+            // 尝试合并相邻的块
+            if new_block.end_seq == self.sack_blocks[i].start_seq {
+                self.sack_blocks[i].start_seq = new_block.start_seq;
+                return;
+            }
+            if new_block.start_seq == self.sack_blocks[i].end_seq {
+                self.sack_blocks[i].end_seq = new_block.end_seq;
+                return;
+            }
+        }
+    }
+    
+    fn cleanup_sack_blocks(&mut self) {
+        // 清理已经被确认的 SACK 块
+        for block in &mut self.sack_blocks {
+            if block.end_seq <= self.last_ack {
+                *block = SackBlock { start_seq: 0, end_seq: 0 };
+            }
+        }
+    }
+    
+    fn is_seq_sacked(&self, seq: u32) -> bool {
+        self.sack_blocks.iter().any(|block| 
+            block.start_seq != 0 && 
+            block.end_seq != 0 && 
+            seq >= block.start_seq && 
+            seq < block.end_seq
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,25 +770,26 @@ mod tests {
             ip_header: IpHeader {
                 version: 4,
                 ihl: 5,
+                tos: 0,
                 total_length: 0,
                 identification: 0,
                 flags: 0,
                 fragment_offset: 0,
                 ttl: 64,
                 protocol: 6,
-                checksum: 0,
-                src_ip: IpAddr::from_str("192.168.1.1").unwrap(),
-                dst_ip: IpAddr::from_str("192.168.1.2").unwrap(),
+                header_checksum: 0,
+                source_ip: u32::from_be_bytes([192,168,1,1]),
+                dest_ip: u32::from_be_bytes([192,168,1,2]),
             },
             src_port: 1234,
             dst_port: 80,
-            protocol: TransportProtocol::Tcp {
+            protocol: TransportProtocol::TCP {
                 seq,
                 ack: 0,
                 flags,
                 window: 65535,
             },
-            payload: payload.to_vec(),
+            payload: BytesMut::from(payload),
         }
     }
 
@@ -554,11 +817,11 @@ mod tests {
         
         println!("[test_out_of_order] 创建数据包完成: packet1.seq={}, packet2.seq={}", 
             match packet1.protocol {
-                TransportProtocol::Tcp { seq, .. } => seq,
+                TransportProtocol::TCP { seq, .. } => seq,
                 _ => 0,
             },
             match packet2.protocol {
-                TransportProtocol::Tcp { seq, .. } => seq,
+                TransportProtocol::TCP { seq, .. } => seq,
                 _ => 0,
             }
         );

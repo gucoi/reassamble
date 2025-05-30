@@ -1,3 +1,5 @@
-mod processor;
+pub use self::processor::{PacketProcessor, BatchPacket, BatchProcessStats};
+pub use self::worker::WorkerPool;
 
-pub use processor::PacketProcessor;
+mod processor;
+mod worker;

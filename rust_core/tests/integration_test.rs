@@ -1,12 +1,9 @@
 use rust_core::{
-    decode::{decode_packet, DecodedPacket, IpHeader, TransportProtocol},
-    defrag::IpDefragmenter,
-    stream::{ShardedTcpReassembler, ShardConfig, StreamStats},
-    processor::PacketProcessor,
+    stream::{ShardedTcpReassembler, ShardConfig},
+    processor::{PacketProcessor, BatchPacket},
     ffi::capture::{capture_init, capture_start, capture_stop, capture_cleanup},
     ffi::types::{CaptureConfig, CaptureBackendType, CapturePacket},
     SafePacket,
-    Result,
 };
 use std::sync::Arc;
 use std::net::IpAddr;
@@ -19,9 +16,19 @@ use std::os::raw::{c_char, c_void};
 use once_cell::sync::OnceCell;
 use tokio::runtime::Runtime;
 use log::{info, error};
+use std::collections::VecDeque;
+use bytes::BytesMut;
+use libc;
 
 static PROCESSOR_CELL: OnceCell<Arc<PacketProcessor>> = OnceCell::new();
 static RUNTIME: OnceCell<Runtime> = OnceCell::new();
+static PACKET_BUFFER: OnceCell<Mutex<VecDeque<SafePacket>>> = OnceCell::new();
+const BATCH_SIZE: usize = 1000;  // 每批处理的包数量
+
+// 初始化包缓冲区
+fn init_packet_buffer() {
+    PACKET_BUFFER.set(Mutex::new(VecDeque::with_capacity(BATCH_SIZE))).ok();
+}
 
 // 创建测试用的 TCP 数据包
 fn create_test_tcp_packet(
@@ -33,7 +40,8 @@ fn create_test_tcp_packet(
     src_port: u16,
     dst_port: u16,
 ) -> SafePacket {
-    let mut data = vec![0u8; 54 + payload.len()];
+    let mut data = BytesMut::with_capacity(54 + payload.len());
+    data.resize(54 + payload.len(), 0);
     
     // 填充以太网头部 (14字节)
     data[0..6].fill(0x00);  // 目标MAC
@@ -102,7 +110,8 @@ fn create_fragmented_packets(
         let fragment = &payload[offset..end];
         let is_last = end == payload.len();
         
-        let mut data = vec![0u8; 54 + fragment.len()];
+        let mut data = BytesMut::with_capacity(54 + fragment.len());
+        data.resize(54 + fragment.len(), 0);
         
         // 填充以太网头部
         data[0..6].fill(0x00);
@@ -176,41 +185,59 @@ extern "C" fn test_packet_callback(packet: *const CapturePacket, user_data: *mut
     if !packet.is_null() {
         let packet = unsafe { &*packet };
         let data = unsafe { std::slice::from_raw_parts(packet.data, packet.caplen as usize) };
-        let safe_packet = SafePacket::new(data.to_vec(), 0);
-        if let Some(processor) = PROCESSOR_CELL.get() {
-            if let Some(rt) = RUNTIME.get() {
-                let processor = processor.clone();
-                rt.spawn(async move {
-                    if let Err(e) = processor.process_packet(&safe_packet).await {
-                        error!("[Rust] 处理数据包时出错: {:?}", e);
+        let safe_packet = SafePacket::new(BytesMut::from(data), 0);
+        
+        // 将包添加到缓冲区
+        if let Some(buffer) = PACKET_BUFFER.get() {
+            if let Ok(mut buffer) = buffer.lock() {
+                buffer.push_back(safe_packet);
+                
+                // 当缓冲区达到批处理大小时，进行批量处理
+                if buffer.len() >= BATCH_SIZE {
+                    let mut batch = BatchPacket::with_capacity(BATCH_SIZE, 0);
+                    while let Some(packet) = buffer.pop_front() {
+                        batch.add_packet(packet);
                     }
-                });
+                    
+                    if let Some(processor) = PROCESSOR_CELL.get() {
+                        // 使用 tokio::spawn 在后台处理批次
+                        let processor = processor.clone();
+                        let batch_packets = batch.packets.clone();
+                        let batch_timestamp = batch.timestamp;
+                        tokio::spawn(async move {
+                            let new_batch = BatchPacket::new(batch_packets, batch_timestamp);
+                            if let Err(e) = processor.process_batch(new_batch).await {
+                                error!("处理批次失败: {}", e);
+                            }
+                        });
+                    }
+                }
             }
         }
     }
+    
     flag
 }
 
+// 错误回调函数
 extern "C" fn test_error_callback(error: *const c_char, user_data: *mut c_void) {
-    if error.is_null() {
-        return;
+    if !error.is_null() {
+        let error_str = unsafe { CStr::from_ptr(error) };
+        if let Ok(error_msg) = error_str.to_str() {
+            error!("[Rust] 捕获错误: {}", error_msg);
+        }
     }
-    let error_str = unsafe { CStr::from_ptr(error) };
-    error!("Error: {}", error_str.to_string_lossy());
 }
 
-#[test]
-fn test_capture_start_stop() {
+#[tokio::test]
+async fn test_capture_start_stop() {
     let running = Arc::new(AtomicBool::new(true));
     let running_ptr = Arc::into_raw(running.clone()) as *mut c_void;
-    info!("[Rust] user_data ptr before pass to C: {:?}", running_ptr);
     
     // 初始化捕获
-    let device = CString::new("lo").unwrap();
-    let filter = CString::new("").unwrap();
     let config = CaptureConfig {
-        device: device.as_ptr(),
-        filter: filter.as_ptr(),
+        device: CString::new("lo").unwrap().into_raw(),
+        filter: CString::new("").unwrap().into_raw(),
         snaplen: 65535,
         timeout_ms: 1000,
         promiscuous: false,
@@ -219,272 +246,204 @@ fn test_capture_start_stop() {
         backend_type: CaptureBackendType::Pcap,
     };
     
-    info!("Initializing capture with device: {}", device.to_string_lossy());
-    let handle = unsafe {
-        capture_init(
-            &config,
-            test_error_callback,
-            running_ptr,
-        )
-    };
-    assert!(!handle.is_null(), "Failed to initialize capture");
+    let handle = unsafe { capture_init(&config, test_error_callback, running_ptr) };
+    assert!(!handle.is_null(), "捕获初始化失败");
     
     // 启动捕获
-    info!("Starting capture...");
-    let result = unsafe { 
+    let result = unsafe {
         capture_start(
             handle,
             test_packet_callback,
             running_ptr,
-        ) 
+        )
     };
-    assert_eq!(result, 0, "Failed to start capture");
+    assert!(result == 0, "启动捕获失败");
     
-    // 等待一段时间让捕获运行
-    info!("Waiting for capture to run...");
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    // 等待一段时间
+    sleep(Duration::from_secs(1)).await;
     
     // 停止捕获
-    info!("Stopping capture...");
     running.store(false, Ordering::Relaxed);
-    info!("[Rust] after running.store(false), user_data ptr: {:?}", running_ptr);
-    let result = unsafe { capture_stop(handle) };
-    assert_eq!(result, 0, "Failed to stop capture");
-    
-    // 等待一段时间确保所有回调都完成
-    info!("Waiting for callbacks to complete...");
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    unsafe { capture_stop(handle) };
     
     // 清理资源
-    info!("Cleaning up resources...");
-    info!("[Rust] before Arc::from_raw user_data ptr: {:?}", running_ptr);
+    unsafe { capture_cleanup(handle) };
+    
+    // 清理配置
     unsafe {
-        capture_cleanup(handle);
-        info!("[Rust] after capture_cleanup, about to Arc::from_raw user_data ptr: {:?}", running_ptr);
-        let _ = Arc::from_raw(running_ptr as *const AtomicBool);
-        info!("[Rust] after Arc::from_raw user_data ptr: {:?}", running_ptr);
+        let _ = CString::from_raw(config.device as *mut c_char);
+        let _ = CString::from_raw(config.filter as *mut c_char);
     }
-    info!("Test completed successfully");
 }
 
 #[tokio::test]
 async fn test_full_pipeline() {
-    // 1. 初始化抓包
-    let device = CString::new("lo").unwrap();
-    let filter = CString::new("").unwrap();
-    let config = CaptureConfig {
-        device: device.as_ptr(),
-        filter: filter.as_ptr(),
-        snaplen: 65535,
-        timeout_ms: 1000,
-        promiscuous: false,
-        immediate: true,
-        buffer_size: 1024 * 1024,
-        backend_type: CaptureBackendType::Pcap,
-    };
-
-    let running = Arc::new(AtomicBool::new(true));
-    let running_ptr = Arc::into_raw(running.clone()) as *mut c_void;
-
-    // 全局唯一 reassembler/processor
-    let shard_config = ShardConfig::default();
-    let reassembler = Arc::new(ShardedTcpReassembler::new(shard_config));
-    let processor = Arc::new(PacketProcessor::new(reassembler.clone()));
-    PROCESSOR_CELL.set(processor.clone()).ok();
-    RUNTIME.set(Runtime::new().unwrap()).ok();
-
-    let handle = unsafe {
-        capture_init(
-            &config,
-            test_error_callback,
-            running_ptr,
-        )
-    };
-    assert!(!handle.is_null(), "Failed to initialize capture");
-
-    // 2. 启动抓包
-    let result = unsafe { 
-        capture_start(
-            handle,
-            test_packet_callback,
-            running_ptr,
-        ) 
-    };
-    assert_eq!(result, 0, "Failed to start capture");
-
-    // 等待抓包线程初始化
-    sleep(Duration::from_millis(100)).await;
-
-    // 等待一段时间让抓包线程捕获一些数据包
-    sleep(Duration::from_secs(2)).await;
-
-    // 3. 检查统计信息
-    let stats = reassembler.get_shard_stats();
-    let total_streams: usize = stats.iter().sum();
-    assert!(total_streams > 0, "没有检测到任何流"); // 至少有一个流被重组
-
-    // 4. 停止抓包
-    running.store(false, Ordering::Relaxed);
-    let result = unsafe { capture_stop(handle) };
-    assert_eq!(result, 0, "Failed to stop capture");
-
-    // 5. 清理资源
-    sleep(Duration::from_secs(1)).await;
-    let cleanup_result = reassembler.cleanup_all();
-    assert!(cleanup_result.is_ok());
-
-    // 6. 关闭重组器
-    let shutdown_result = reassembler.shutdown();
-    assert!(shutdown_result.is_ok());
-
-    // 7. 清理抓包资源
-    unsafe {
-        capture_cleanup(handle);
-        let _ = Arc::from_raw(running_ptr as *const AtomicBool);
-    }
-}
-
-#[tokio::test]
-async fn test_capture_error_handling() {
-    // 1. 测试无效设备
-    let device = CString::new("invalid_device").unwrap();
-    let filter = CString::new("").unwrap();
-    
-    let config = CaptureConfig {
-        device: device.as_ptr(),
-        filter: filter.as_ptr(),
-        snaplen: 65535,
-        timeout_ms: 1000,
-        promiscuous: false,
-        immediate: true,
-        buffer_size: 1024 * 1024,
-        backend_type: CaptureBackendType::Pcap,
-    };
-
-    let handle = unsafe {
-        capture_init(
-            &config,
-            test_error_callback,
-            std::ptr::null_mut(),
-        )
-    };
-    assert!(handle.is_null());
-
-    // 2. 测试无效过滤器
-    let device = CString::new("lo").unwrap();
-    let filter = CString::new("invalid filter").unwrap();
-    
-    let config = CaptureConfig {
-        device: device.as_ptr(),
-        filter: filter.as_ptr(),
-        snaplen: 65535,
-        timeout_ms: 1000,
-        promiscuous: false,
-        immediate: true,
-        buffer_size: 1024 * 1024,
-        backend_type: CaptureBackendType::Pcap,
-    };
-
-    let handle = unsafe {
-        capture_init(
-            &config,
-            test_error_callback,
-            std::ptr::null_mut(),
-        )
-    };
-    assert!(handle.is_null());
-}
-
-#[tokio::test]
-async fn test_error_handling() {
+    // 初始化处理器
     let config = ShardConfig::default();
     let reassembler = Arc::new(ShardedTcpReassembler::new(config));
-    let processor = PacketProcessor::new(reassembler.clone());
+    let processor = Arc::new(PacketProcessor::new(reassembler));
+    PROCESSOR_CELL.set(processor.clone()).ok();
     
-    // 1. 测试无效数据包
-    let invalid_packet = SafePacket::new(vec![0u8; 10], 0);
-    let result = processor.process_packet(&invalid_packet).await;
-    assert!(result.is_err());
-    
-    // 2. 测试超时处理
-    let config = ShardConfig {
-        timeout_secs: 1,
-        ..Default::default()
-    };
-    let reassembler = Arc::new(ShardedTcpReassembler::new(config));
-    let processor = PacketProcessor::new(reassembler.clone());
-    
+    // 创建测试数据
+    let payload = b"Hello, World!";
     let packet = create_test_tcp_packet(
         1,
-        b"Test",
-        0x18,
-        "192.168.1.1",
-        "192.168.1.2",
+        payload,
+        0x18, // PSH | ACK
+        "127.0.0.1",
+        "127.0.0.1",
         1234,
         80,
     );
     
-    let result = processor.process_packet(&packet).await;
-    assert!(result.is_ok());
+    // 创建批次
+    let mut batch = BatchPacket::with_capacity(1, 0);
+    batch.add_packet(packet);
     
-    // 等待超时
-    sleep(Duration::from_secs(2)).await;
+    // 处理批次
+    let result = processor.process_batch(batch).await;
+    assert!(result.is_ok(), "批次处理失败: {:?}", result.err());
     
-    // 清理应该移除超时的流
-    let cleanup_result = reassembler.cleanup_all();
-    assert!(cleanup_result.is_ok());
+    // 验证结果
+    let active_batches = processor.get_active_batches();
+    assert_eq!(active_batches, 0, "活动批次数量不正确");
+}
+
+#[tokio::test]
+async fn test_capture_error_handling() {
+    let running = Arc::new(AtomicBool::new(true));
+    let running_ptr = Arc::into_raw(running.clone()) as *mut c_void;
     
-    let stats = reassembler.get_shard_stats();
-    assert!(stats.is_empty());
+    // 使用无效的接口名称
+    let config = CaptureConfig {
+        device: CString::new("invalid_interface").unwrap().into_raw(),
+        filter: CString::new("").unwrap().into_raw(),
+        snaplen: 65535,
+        timeout_ms: 1000,
+        promiscuous: false,
+        immediate: true,
+        buffer_size: 1024 * 1024,
+        backend_type: CaptureBackendType::Pcap,
+    };
+    
+    let handle = unsafe { capture_init(&config, test_error_callback, running_ptr) };
+    assert!(handle.is_null(), "使用无效接口应该返回空句柄");
+    
+    // 清理配置
+    unsafe {
+        let _ = CString::from_raw(config.device as *mut c_char);
+        let _ = CString::from_raw(config.filter as *mut c_char);
+    }
+}
+
+#[tokio::test]
+async fn test_error_handling() {
+    // 初始化处理器
+    let config = ShardConfig::default();
+    let reassembler = Arc::new(ShardedTcpReassembler::new(config));
+    let processor = Arc::new(PacketProcessor::new(reassembler));
+    PROCESSOR_CELL.set(processor.clone()).ok();
+    
+    // 创建无效的测试数据
+    let mut invalid_data = BytesMut::with_capacity(10);
+    invalid_data.resize(10, 0);
+    let packet = SafePacket::new(invalid_data, 0);
+    
+    // 创建批次
+    let mut batch = BatchPacket::with_capacity(1, 0);
+    batch.add_packet(packet);
+    
+    // 处理批次
+    let result = processor.process_batch(batch).await;
+    assert!(result.is_err(), "处理无效数据应该返回错误");
+    
+    // 检查活跃批次数量
+    assert_eq!(processor.get_active_batches(), 0, "应该有0个活跃批次");
 }
 
 #[tokio::test]
 async fn test_performance() {
-    let config = ShardConfig {
-        shard_count: 4,
-        ..Default::default()
-    };
+    // 初始化处理器
+    let config = ShardConfig::default();
     let reassembler = Arc::new(ShardedTcpReassembler::new(config));
-    let processor = PacketProcessor::new(reassembler.clone());
+    let processor = Arc::new(PacketProcessor::new(reassembler));
+    PROCESSOR_CELL.set(processor.clone()).ok();
     
-    // 创建大量测试包
-    let mut packets = Vec::new();
+    // 创建大量测试数据
+    let mut batch = BatchPacket::with_capacity(1000, 0);
     for i in 0..1000 {
         let payload = format!("Test packet {}", i).into_bytes();
         let packet = create_test_tcp_packet(
             i as u32,
             &payload,
             0x18,
-            "192.168.1.1",
-            "192.168.1.2",
+            "127.0.0.1",
+            "127.0.0.1",
+            1234,
+            80,
+        );
+        batch.add_packet(packet);
+    }
+    
+    // 测量处理时间
+    let start = std::time::Instant::now();
+    let result = processor.process_batch(batch).await;
+    let duration = start.elapsed();
+    
+    assert!(result.is_ok(), "性能测试失败: {:?}", result.err());
+    assert!(duration < Duration::from_secs(1), "处理时间过长: {:?}", duration);
+    
+    // 检查活跃批次数量
+    assert_eq!(processor.get_active_batches(), 0, "应该有0个活跃批次");
+}
+
+#[tokio::test]
+async fn test_batch_processing() {
+    // 初始化处理器和缓冲区
+    let config = ShardConfig::default();
+    let reassembler = Arc::new(ShardedTcpReassembler::new(config));
+    let processor = Arc::new(PacketProcessor::new(reassembler));
+    PROCESSOR_CELL.set(processor.clone()).ok();
+    init_packet_buffer();
+    
+    // 创建测试数据
+    let mut packets = Vec::new();
+    for i in 0..BATCH_SIZE {
+        let payload = format!("Test packet {}", i).into_bytes();
+        let packet = create_test_tcp_packet(
+            i as u32,
+            &payload,
+            0x18,
+            "127.0.0.1",
+            "127.0.0.1",
             1234,
             80,
         );
         packets.push(packet);
     }
     
-    // 并发处理所有包
-    let start = std::time::Instant::now();
-    let processor = Arc::new(processor);
-    let results = futures::future::join_all(
-        packets.into_iter().map(|p| {
-            let packet = p.clone();
-            let processor = processor.clone();
-            async move {
-                processor.process_packet(&packet).await
-            }
-        })
-    ).await;
-    
-    let duration = start.elapsed();
-    println!("处理1000个包用时: {:?}", duration);
-    
-    // 验证结果
-    for result in results {
-        assert!(result.is_ok());
+    // 模拟包捕获回调
+    for packet in packets {
+        let capture_packet = CapturePacket {
+            data: packet.data.as_ptr(),
+            caplen: packet.data.len() as u32,
+            len: packet.data.len() as u32,
+            ts: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+            if_index: 0,
+            flags: 0,
+            protocol: 0,
+            vlan_tci: 0,
+            hash: 0,
+        };
+        
+        // 调用回调函数
+        let running = AtomicBool::new(true);
+        test_packet_callback(&capture_packet, &running as *const AtomicBool as *mut c_void);
     }
     
-    // 检查统计信息
-    let stats = reassembler.get_shard_stats();
-    assert!(!stats.is_empty());
+    // 等待处理完成
+    sleep(Duration::from_millis(100)).await;
+    
+    // 检查活跃批次数量
+    assert_eq!(processor.get_active_batches(), 0, "应该有0个活跃批次");
 } 

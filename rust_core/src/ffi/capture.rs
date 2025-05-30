@@ -19,12 +19,6 @@ extern "C" {
     pub fn capture_cleanup(handle: *mut CaptureHandle);
     pub fn capture_set_filter(handle: *mut CaptureHandle, filter: *const c_char) -> i32;
     pub fn capture_get_stats(handle: *mut CaptureHandle, stats: *mut CaptureStats) -> i32;
-    
-    // 添加缺失的函数
-    pub fn capture_pause(handle: *mut CaptureHandle) -> i32;
-    pub fn capture_resume(handle: *mut CaptureHandle) -> i32;
-    pub fn capture_get_devices(devices: *mut *mut CaptureDevice, count: *mut i32) -> i32;
-    pub fn capture_free_devices(devices: *mut CaptureDevice, count: i32);
 }
 
 // 添加安全的 Rust 包装函数
@@ -81,42 +75,4 @@ pub fn get_capture_stats(handle: *mut CaptureHandle) -> Result<CaptureStats, i32
     } else {
         Err(result)
     }
-}
-
-pub fn pause_capture(handle: *mut CaptureHandle) -> Result<(), i32> {
-    let result = unsafe { capture_pause(handle) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(result)
-    }
-}
-
-pub fn resume_capture(handle: *mut CaptureHandle) -> Result<(), i32> {
-    let result = unsafe { capture_resume(handle) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(result)
-    }
-}
-
-pub fn get_capture_devices() -> Result<Vec<CaptureDevice>, i32> {
-    let mut devices: *mut CaptureDevice = std::ptr::null_mut();
-    let mut count: i32 = 0;
-    
-    let result = unsafe { capture_get_devices(&mut devices, &mut count) };
-    if result != 0 {
-        return Err(result);
-    }
-    
-    let mut device_vec = Vec::with_capacity(count as usize);
-    unsafe {
-        for i in 0..count {
-            device_vec.push(std::ptr::read(devices.add(i as usize)));
-        }
-        capture_free_devices(devices, count);
-    }
-    
-    Ok(device_vec)
 } 

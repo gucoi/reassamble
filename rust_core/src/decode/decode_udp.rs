@@ -2,9 +2,16 @@ use crate::SafePacket;
 use super::error::{DecodeError, DecodeResult, UdpHeaderError};
 use super::decode::{IpHeader, DecodedPacket, TransportProtocol};
 
+// UDP相关常量
+const MIN_UDP_SIZE: usize = 42;  // 以太网(14) + IP(20) + UDP(8)
+const UDP_HEADER_SIZE: usize = 8;  // UDP头部固定8字节
+const UDP_SRC_PORT_OFFSET: usize = 0;  // UDP源端口偏移
+const UDP_DEST_PORT_OFFSET: usize = 2;  // UDP目标端口偏移
+const UDP_LENGTH_OFFSET: usize = 4;  // UDP长度偏移
+const UDP_CHECKSUM_OFFSET: usize = 6;  // UDP校验和偏移
+
 /// 解码UDP包
 pub fn decode_udp_packet(packet: &SafePacket, ip_header: &IpHeader) -> DecodeResult<DecodedPacket> {
-    const MIN_UDP_SIZE: usize = 42; // 以太网(14) + IP(20) + UDP(8)
     if packet.data.len() < MIN_UDP_SIZE {
         return Err(DecodeError::InsufficientLength {
             required: MIN_UDP_SIZE,
@@ -14,17 +21,26 @@ pub fn decode_udp_packet(packet: &SafePacket, ip_header: &IpHeader) -> DecodeRes
 
     let ip_header_len = (packet.data[14] & 0x0f) * 4;
     let udp_offset = 14 + ip_header_len as usize;
-    let payload_offset = udp_offset + 8;  // UDP头部固定8字节
+    let payload_offset = udp_offset + UDP_HEADER_SIZE;
 
     // 验证UDP长度
-    let udp_length = u16::from_be_bytes([packet.data[udp_offset + 4], packet.data[udp_offset + 5]]);
-    if udp_length < 8 || udp_length > packet.data.len() as u16 - udp_offset as u16 {
+    let udp_length = u16::from_be_bytes([
+        packet.data[udp_offset + UDP_LENGTH_OFFSET],
+        packet.data[udp_offset + UDP_LENGTH_OFFSET + 1]
+    ]);
+    if udp_length < UDP_HEADER_SIZE as u16 || udp_length > packet.data.len() as u16 - udp_offset as u16 {
         return Err(UdpHeaderError::InvalidLength { length: udp_length }.into());
     }
 
     // 验证端口号
-    let src_port = u16::from_be_bytes([packet.data[udp_offset], packet.data[udp_offset + 1]]);
-    let dst_port = u16::from_be_bytes([packet.data[udp_offset + 2], packet.data[udp_offset + 3]]);
+    let src_port = u16::from_be_bytes([
+        packet.data[udp_offset + UDP_SRC_PORT_OFFSET],
+        packet.data[udp_offset + UDP_SRC_PORT_OFFSET + 1]
+    ]);
+    let dst_port = u16::from_be_bytes([
+        packet.data[udp_offset + UDP_DEST_PORT_OFFSET],
+        packet.data[udp_offset + UDP_DEST_PORT_OFFSET + 1]
+    ]);
     if src_port == 0 || dst_port == 0 {
         return Err(UdpHeaderError::InvalidPort { port: if src_port == 0 { src_port } else { dst_port } }.into());
     }
@@ -37,8 +53,14 @@ pub fn decode_udp_packet(packet: &SafePacket, ip_header: &IpHeader) -> DecodeRes
         ip_header: ip_header.clone(),
         src_port,
         dst_port,
-        protocol: TransportProtocol::Udp,
-        payload,
+        protocol: TransportProtocol::UDP {
+            length: udp_length,
+            checksum: u16::from_be_bytes([
+                packet.data[udp_offset + UDP_CHECKSUM_OFFSET],
+                packet.data[udp_offset + UDP_CHECKSUM_OFFSET + 1]
+            ]),
+        },
+        payload: payload.into(),
     })
 }
 
@@ -48,7 +70,6 @@ pub fn decode_udp_packet_with_buffer(
     buffer: &[u8],
     ip_header: &IpHeader,
 ) -> DecodeResult<DecodedPacket> {
-    const MIN_UDP_SIZE: usize = 42; // 以太网(14) + IP(20) + UDP(8)
     if buffer.len() < MIN_UDP_SIZE {
         return Err(DecodeError::InsufficientLength {
             required: MIN_UDP_SIZE,
@@ -58,17 +79,26 @@ pub fn decode_udp_packet_with_buffer(
 
     let ip_header_len = (buffer[14] & 0x0f) * 4;
     let udp_offset = 14 + ip_header_len as usize;
-    let payload_offset = udp_offset + 8;  // UDP头部固定8字节
+    let payload_offset = udp_offset + UDP_HEADER_SIZE;
 
     // 验证UDP长度
-    let udp_length = u16::from_be_bytes([buffer[udp_offset + 4], buffer[udp_offset + 5]]);
-    if udp_length < 8 || udp_length > buffer.len() as u16 - udp_offset as u16 {
+    let udp_length = u16::from_be_bytes([
+        buffer[udp_offset + UDP_LENGTH_OFFSET],
+        buffer[udp_offset + UDP_LENGTH_OFFSET + 1]
+    ]);
+    if udp_length < UDP_HEADER_SIZE as u16 || udp_length > buffer.len() as u16 - udp_offset as u16 {
         return Err(UdpHeaderError::InvalidLength { length: udp_length }.into());
     }
 
     // 验证端口号
-    let src_port = u16::from_be_bytes([buffer[udp_offset], buffer[udp_offset + 1]]);
-    let dst_port = u16::from_be_bytes([buffer[udp_offset + 2], buffer[udp_offset + 3]]);
+    let src_port = u16::from_be_bytes([
+        buffer[udp_offset + UDP_SRC_PORT_OFFSET],
+        buffer[udp_offset + UDP_SRC_PORT_OFFSET + 1]
+    ]);
+    let dst_port = u16::from_be_bytes([
+        buffer[udp_offset + UDP_DEST_PORT_OFFSET],
+        buffer[udp_offset + UDP_DEST_PORT_OFFSET + 1]
+    ]);
     if src_port == 0 || dst_port == 0 {
         return Err(UdpHeaderError::InvalidPort { port: if src_port == 0 { src_port } else { dst_port } }.into());
     }
@@ -82,8 +112,14 @@ pub fn decode_udp_packet_with_buffer(
         ip_header: ip_header.clone(),
         src_port,
         dst_port,
-        protocol: TransportProtocol::Udp,
-        payload,
+        protocol: TransportProtocol::UDP {
+            length: udp_length,
+            checksum: u16::from_be_bytes([
+                buffer[udp_offset + UDP_CHECKSUM_OFFSET],
+                buffer[udp_offset + UDP_CHECKSUM_OFFSET + 1]
+            ]),
+        },
+        payload: payload.into(),
     })
 }
 

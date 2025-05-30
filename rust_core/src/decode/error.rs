@@ -2,10 +2,10 @@ use thiserror::Error;
 use std::net::IpAddr;
 
 /// 解码错误类型
-#[derive(Error, Debug)]
+#[derive(Debug, Error)]
 pub enum DecodeError {
     /// 数据包为空
-    #[error("数据包为空")]
+    #[error("空数据包")]
     EmptyPacket,
 
     /// 数据包长度不足
@@ -50,18 +50,16 @@ pub enum DecodeError {
 }
 
 /// IP头部错误类型
-#[derive(Error, Debug)]
+#[derive(Debug, Error)]
 pub enum IpHeaderError {
     /// 版本错误
-    #[error("不支持的IP版本: {version}")]
-    InvalidVersion {
-        version: u8,
-    },
+    #[error("IP头部长度不足")]
+    TooShort,
 
     /// IHL错误
-    #[error("无效的IHL值: {ihl}")]
-    InvalidIHL {
-        ihl: u8,
+    #[error("IP版本不支持: {version}")]
+    UnsupportedVersion {
+        version: u8,
     },
 
     /// 总长度错误
@@ -81,12 +79,20 @@ pub enum IpHeaderError {
     InvalidDestinationIp {
         ip: IpAddr,
     },
+
+    /// 校验和错误
+    #[error("IP头部校验和错误")]
+    InvalidChecksum,
 }
 
 /// TCP头部错误类型
-#[derive(Error, Debug)]
+#[derive(Debug, Error)]
 pub enum TcpHeaderError {
     /// 头部长度错误
+    #[error("TCP头部长度不足")]
+    TooShort,
+
+    /// 头部长度无效
     #[error("无效的TCP头部长度: {length}")]
     InvalidHeaderLength {
         length: u8,
@@ -109,12 +115,20 @@ pub enum TcpHeaderError {
     InvalidFlags {
         flags: u8,
     },
+
+    /// 校验和错误
+    #[error("TCP头部校验和错误")]
+    InvalidChecksum,
 }
 
 /// UDP头部错误类型
-#[derive(Error, Debug)]
+#[derive(Debug, Error)]
 pub enum UdpHeaderError {
     /// 长度错误
+    #[error("UDP头部长度不足")]
+    TooShort,
+
+    /// 无效长度
     #[error("无效的UDP长度: {length}")]
     InvalidLength {
         length: u16,
@@ -125,28 +139,26 @@ pub enum UdpHeaderError {
     InvalidPort {
         port: u16,
     },
+
+    /// 校验和错误
+    #[error("UDP头部校验和错误")]
+    InvalidChecksum,
 }
 
 /// 缓冲区错误类型
-#[derive(Error, Debug)]
+#[derive(Debug, Error)]
 pub enum BufferError {
     /// 缓冲区容量不足
-    #[error("缓冲区容量不足: 需要 {required} 字节，实际 {actual} 字节")]
-    InsufficientCapacity {
-        required: usize,
-        actual: usize,
-    },
+    #[error("缓冲区太短")]
+    TooShort,
 
     /// 缓冲区为空
     #[error("缓冲区为空")]
     EmptyBuffer,
 
     /// 缓冲区溢出
-    #[error("缓冲区溢出: 尝试写入 {attempted} 字节到 {capacity} 字节的缓冲区")]
-    BufferOverflow {
-        attempted: usize,
-        capacity: usize,
-    },
+    #[error("缓冲区溢出")]
+    Overflow,
 }
 
 impl DecodeError {

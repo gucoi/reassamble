@@ -1,8 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use dashmap::DashMap;
-use libc::_SC_EQUIV_CLASS_MAX;
-use tokio::sync::RwLock;
 use super::stream_tcp::TcpReassembler;
 use crate::decode::{DecodedPacket, TransportProtocol};
 use crate::error::Result;
@@ -11,6 +9,7 @@ use std::collections::HashMap;
 use tokio::time::{Duration, Instant};
 use log::{warn, info};
 use parking_lot;
+use bytes::BytesMut;
 
 /// 分片重组器的配置参数
 #[derive(Debug, Clone)]
@@ -150,7 +149,7 @@ impl ShardedTcpReassembler {
         if packet.payload.len() >= threshold {
             // 使用位运算优化
             let seq = match packet.protocol {
-                TransportProtocol::Tcp { seq, .. } => seq,
+                TransportProtocol::TCP { seq, .. } => seq,
                 _ => 0,
             };
             ((seq as usize) & (self.shard_count - 1)) ^ base_shard
@@ -175,9 +174,9 @@ impl ShardedTcpReassembler {
 
     pub fn process_packet(&self, packet: &DecodedPacket) -> Option<Vec<u8>> {
         let stream_key = format!("{}:{}-{}:{}",
-            packet.ip_header.src_ip,
+            packet.ip_header.source_ip,
             packet.src_port,
-            packet.ip_header.dst_ip,
+            packet.ip_header.dest_ip,
             packet.dst_port
         );
 
@@ -284,23 +283,23 @@ mod tests {
     fn dummy_packet() -> DecodedPacket {
         DecodedPacket {
             ip_header: IpHeader {
-                src_ip: "127.0.0.1".parse().unwrap(),
-                dst_ip: "127.0.0.1".parse().unwrap(),
-                protocol: 6,
                 version: 4,
                 ihl: 5,
+                tos: 0,
                 total_length: 40,
                 identification: 54321,
                 flags: 0,
                 fragment_offset: 0,
                 ttl: 64,
-                checksum: 0,
+                protocol: 6,
+                header_checksum: 0,
+                source_ip: u32::from_be_bytes([127,0,0,1]),
+                dest_ip: u32::from_be_bytes([127,0,0,1]),
             },
             src_port: 1234,
             dst_port: 5678,
-            protocol: TransportProtocol::Tcp { seq: 0, ack: 0 , 
-                flags: 0, window: 0},
-            payload: vec![],
+            protocol: TransportProtocol::TCP { seq: 0, ack: 0, flags: 0, window: 0 },
+            payload: BytesMut::new(),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -334,7 +333,8 @@ mod tests {
 
     fn create_large_test_packet() -> DecodedPacket {
         let mut packet = dummy_packet();
-        packet.payload = vec![0; 1024]; // 1KB payload
+        let data = vec![0; 1024]; // 1KB payload
+        packet.payload = BytesMut::from(&data[..]);
         packet
     }
 

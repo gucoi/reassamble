@@ -5,6 +5,7 @@ pub mod defrag;
 pub mod stream;
 pub mod processor;
 pub mod ffi;
+pub mod memory;
 
 
 // Re-export commonly used types
@@ -13,10 +14,15 @@ pub use processor::PacketProcessor;
 pub use defrag::IpDefragmenter;
 pub use stream::{ShardedTcpReassembler, ShardConfig};
 pub use error::{Result, PacketError, ReassembleError};
+pub use memory::{MemoryPool, MemoryBlock, MemoryPoolConfig, init_global_pool, get_global_pool};
 pub use tokio::runtime::Runtime;
 pub use std::sync::OnceLock;
 pub use std::sync::Arc;
 use futures::TryFutureExt;
+use bytes::{Bytes, BytesMut, BufMut};
+use std::time::{Duration, Instant};
+use log::{info, warn, error};
+use thiserror::Error;
 
 // 重新导出常用类型
 pub use ffi::types::{CapturePacket, ReassemblePacket};
@@ -32,11 +38,25 @@ fn get_runtime() -> &'static Runtime {
     })
 }
 
+// 初始化内存池
+pub fn init_memory_pool() {
+    let config = MemoryPoolConfig {
+        min_block_size: 1024,
+        max_block_size: 1024 * 1024, // 1MB
+        initial_pool_size: 1000,
+        max_pool_size: 10000,
+    };
+    init_global_pool(Some(config));
+}
+
 // 全局共享重组器
 static REASSEMBLER: OnceLock<Arc<ShardedTcpReassembler>> = OnceLock::new();
 
 fn get_reassembler() -> &'static Arc<ShardedTcpReassembler> {
     REASSEMBLER.get_or_init(|| {
+        // 确保内存池已初始化
+        init_memory_pool();
+        
         let config = ShardConfig::default();
         let reassembler = Arc::new(ShardedTcpReassembler::new(config));
         
@@ -61,21 +81,31 @@ fn get_processor() -> &'static Arc<PacketProcessor> {
 
 #[repr(C)]
 pub struct Packet {
-    data: *const u8,
-    len: usize,
-    timestamp: u64,
+    pub data: *const u8,
+    pub len: usize,
+    pub timestamp: u64,
 }
 
 // 添加一个安全的包结构体
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct SafePacket {
-    pub data: Vec<u8>,
+    pub data: BytesMut,
     pub timestamp: u64,
 }
 
 impl SafePacket {
-    pub fn new(data: Vec<u8>, timestamp: u64) -> Self {
-        Self { data, timestamp }
+    pub fn new(data: BytesMut, timestamp: u64) -> Self {
+        Self {
+            data,
+            timestamp,
+        }
+    }
+
+    pub fn from_bytes(data: &[u8], timestamp: u64) -> Self {
+        Self {
+            data: BytesMut::from(data),
+            timestamp,
+        }
     }
 }
 
@@ -94,7 +124,7 @@ pub extern "C" fn process_packet(packet: *const Packet) -> Result<()> {
             let p = &*packet;
             let slice = std::slice::from_raw_parts(p.data, p.len);
             SafePacket {
-                data: slice.to_vec(),
+                data: BytesMut::from(slice),
                 timestamp: p.timestamp,
             }
         };

@@ -1,5 +1,6 @@
 use super::types::ReassemblePacket;
 use crate::error::Result;
+use bytes;
 
 #[no_mangle]
 pub extern "C" fn process_reassemble_packet(packet: *const ReassemblePacket) -> Result<()> {
@@ -18,7 +19,7 @@ pub extern "C" fn process_reassemble_packet(packet: *const ReassemblePacket) -> 
             let p = &*packet;
             let slice = std::slice::from_raw_parts(p.data, p.len);
             crate::SafePacket {
-                data: slice.to_vec(),
+                data: bytes::BytesMut::from(slice),
                 timestamp: p.timestamp,
             }
         };

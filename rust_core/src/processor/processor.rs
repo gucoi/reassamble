@@ -1,15 +1,48 @@
 use crate::{
-    decode::{decode_packet, TransportProtocol},
+    decode::{decode_packet, TransportProtocol, DecodedPacket},
     defrag::IpDefragmenter,
     stream::ShardedTcpReassembler,
     SafePacket, Result, ReassembleError,
 };
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use log::{info, error};
+use super::worker::WorkerPool;
+use rayon::prelude::*;
+use crossbeam_channel::{bounded, Sender, Receiver};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use bytes::BytesMut;
+
+/// 批量数据包结构
+#[derive(Debug)]
+pub struct BatchPacket {
+    pub packets: Vec<SafePacket>,
+    pub timestamp: u64,
+}
+
+impl BatchPacket {
+    pub fn new(packets: Vec<SafePacket>, timestamp: u64) -> Self {
+        Self { packets, timestamp }
+    }
+
+    pub fn with_capacity(capacity: usize, timestamp: u64) -> Self {
+        Self {
+            packets: Vec::with_capacity(capacity),
+            timestamp,
+        }
+    }
+
+    pub fn add_packet(&mut self, packet: SafePacket) {
+        self.packets.push(packet);
+    }
+}
 
 pub struct PacketProcessor {
     defragmenter: Arc<RwLock<IpDefragmenter>>,
     reassembler: Arc<ShardedTcpReassembler>,
+    worker_pool: Arc<WorkerPool>,
+    batch_size: usize,
+    active_batches: AtomicUsize,
 }
 
 impl PacketProcessor {
@@ -17,35 +50,105 @@ impl PacketProcessor {
         Self {
             defragmenter: Arc::new(RwLock::new(IpDefragmenter::new(30, 60, 10))),
             reassembler,
+            worker_pool: Arc::new(WorkerPool::new()),
+            batch_size: 1000,
+            active_batches: AtomicUsize::new(0),
         }
     }
 
     pub async fn process_packet(&self, packet: &SafePacket) -> Result<Option<Vec<u8>>> {
-        // 1. 解码数据包
+        // 使用工作线程池处理数据包
+        self.worker_pool.submit(packet.clone());
+        
+        // 解码数据包
         let decoded = decode_packet(packet)
             .map_err(|e| ReassembleError::DecodeError(e.to_string()))?;
-
-        // 2. IP 分片重组
-        let defrag_result = {
-            let mut defragmenter = self.defragmenter.write().await;
-            defragmenter.process_packet(&decoded)
-        };
-
-        // 3. 处理分片结果
-        match defrag_result {
-            Some(complete_packet) => {
-                match complete_packet.protocol {
-                    TransportProtocol::Tcp { .. } => {
-                        Ok(self.reassembler.process_packet(&complete_packet))
-                    }
-                    TransportProtocol::Udp => {
-                        Ok(Some(complete_packet.payload))
-                    }
-                    _ => Ok(None),
-                }
+        
+        // 处理分片
+        if decoded.ip_header.flags & 0x2000u16 != 0 {
+            let mut defrag = self.defragmenter.write().await;
+            if let Some(reassembled) = defrag.process_packet(&decoded) {
+                return Ok(Some(reassembled.to_vec()));
             }
-            None => Ok(None),
+            return Ok(None);
         }
+        
+        // 处理 TCP 重组
+        if let TransportProtocol::TCP { .. } = decoded.protocol {
+            if let Some(reassembled) = self.reassembler.process_packet(&decoded) {
+                return Ok(Some(reassembled.to_vec()));
+            }
+        }
+        
+        Ok(None)
+    }
+
+    pub async fn process_batch(&self, batch: BatchPacket) -> Result<Vec<Option<Vec<u8>>>> {
+        self.active_batches.fetch_add(1, Ordering::Relaxed);
+
+        // 1. 先串行处理分片重组
+        let mut ready_packets = Vec::with_capacity(batch.packets.len());
+        for packet in &batch.packets {
+            let decoded = match decode_packet(packet) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            if decoded.ip_header.flags & 0x2000u16 != 0 {
+                let mut defrag = self.defragmenter.write().await;
+                if let Some(reassembled) = defrag.process_packet(&decoded) {
+                    // 只将重组完成的包加入 ready_packets
+                    ready_packets.push(SafePacket::new(reassembled.payload.clone(), packet.timestamp));
+                }
+            } else {
+                ready_packets.push(packet.clone());
+            }
+        }
+
+        // 2. 并行处理 TCP 重组和其它逻辑
+        let results: Vec<_> = ready_packets.par_iter()
+            .map(|packet| {
+                let decoded = decode_packet(packet).ok()?;
+                if let TransportProtocol::TCP { .. } = decoded.protocol {
+                    self.reassembler.process_packet(&decoded)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        self.active_batches.fetch_sub(1, Ordering::Relaxed);
+        Ok(results)
+    }
+
+    pub fn get_active_batches(&self) -> usize {
+        self.active_batches.load(Ordering::Relaxed)
+    }
+
+    pub fn set_batch_size(&mut self, size: usize) {
+        self.batch_size = size;
+    }
+}
+
+/// 批量处理统计信息
+#[derive(Debug, Default)]
+pub struct BatchProcessStats {
+    pub total_packets: usize,
+    pub successful_packets: usize,
+    pub partial_packets: usize,
+    pub failed_packets: usize,
+    pub processing_time: std::time::Duration,
+}
+
+impl BatchProcessStats {
+    pub fn throughput(&self) -> f64 {
+        self.total_packets as f64 / self.processing_time.as_secs_f64()
+    }
+    
+    pub fn success_rate(&self) -> f64 {
+        if self.total_packets == 0 {
+            return 0.0;
+        }
+        self.successful_packets as f64 / self.total_packets as f64
     }
 }
 
@@ -57,89 +160,80 @@ mod tests {
     use crate::ShardConfig;
 
     fn create_test_tcp_packet() -> SafePacket{
-        // Create a simple TCP packet for testing
-        SafePacket::new(vec![
+        SafePacket::new(BytesMut::from(&[
             0x45, 0x00, 0x00, 0x28, // IP header
             0x00, 0x00, 0x40, 0x00,
             0x40, 0x06, 0x00, 0x00,
             0x7f, 0x00, 0x00, 0x01,
             0x7f, 0x00, 0x00, 0x01,
-            // TCP header
             0x00, 0x50, 0x00, 0x50,
             0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00,
-            0x50, 0x02, 0x20, 0x00,
+            0x50, 0x02, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00
-            ], 
-            0
-        )
-}
+        ][..]), 0)
+    }
 
     fn create_test_ip_fragments() -> (SafePacket, SafePacket) {
-        // First fragment
-        let frag1 = SafePacket::new(vec![
+        let frag1 = SafePacket::new(BytesMut::from(&[
             0x45, 0x00, 0x00, 0x20, // IP header
             0x00, 0x01, 0x20, 0x00, // Flags=1 (More Fragments)
             0x40, 0x01, 0x00, 0x00,
             0x7f, 0x00, 0x00, 0x01,
             0x7f, 0x00, 0x00, 0x01,
-            // Payload
-            0x08, 0x00, 0x00, 0x00,
+            0x00, 0x50, 0x00, 0x50,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
             0x00, 0x01, 0x02, 0x03
-        ], 0);
-
-        // Second fragment
-        let frag2 = SafePacket::new(vec![
+        ][..]), 0);
+        let frag2 = SafePacket::new(BytesMut::from(&[
             0x45, 0x00, 0x00, 0x20, // IP header
             0x00, 0x01, 0x20, 0x08, // Fragment Offset=8
             0x40, 0x01, 0x00, 0x00,
             0x7f, 0x00, 0x00, 0x01,
             0x7f, 0x00, 0x00, 0x01,
-            // Payload
-            0x04, 0x05, 0x06, 0x07,
+            0x00, 0x50, 0x00, 0x50,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
             0x08, 0x09, 0x0a, 0x0b
-        ], 0);
-
+        ][..]), 0);
         (frag1, frag2)
     }
 
     fn create_test_ip_fragments_three_parts() -> (SafePacket, SafePacket, SafePacket) {
-        // First fragment
-        let frag1 = SafePacket::new(vec![
+        let frag1 = SafePacket::new(BytesMut::from(&[
             0x45, 0x00, 0x00, 0x20, // IP header
             0x00, 0x01, 0x20, 0x00, // Flags=1 (More Fragments)
             0x40, 0x01, 0x00, 0x00,
             0x7f, 0x00, 0x00, 0x01,
             0x7f, 0x00, 0x00, 0x01,
-            // Payload
-            0x08, 0x00, 0x00, 0x00,
+            0x00, 0x50, 0x00, 0x50,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
             0x00, 0x01, 0x02, 0x03
-        ], 0);
-
-        // Second fragment
-        let frag2 = SafePacket::new(vec![
+        ][..]), 0);
+        let frag2 = SafePacket::new(BytesMut::from(&[
             0x45, 0x00, 0x00, 0x20, // IP header
             0x00, 0x01, 0x20, 0x08, // Flags=1 (More Fragments)
             0x40, 0x01, 0x00, 0x00,
             0x7f, 0x00, 0x00, 0x01,
             0x7f, 0x00, 0x00, 0x01,
-            // Payload
-            0x04, 0x05, 0x06, 0x07,
+            0x00, 0x50, 0x00, 0x50,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
             0x08, 0x09, 0x0a, 0x0b
-        ], 0);
-
-        // Third fragment
-        let frag3 = SafePacket::new(vec![
+        ][..]), 0);
+        let frag3 = SafePacket::new(BytesMut::from(&[
             0x45, 0x00, 0x00, 0x20, // IP header
             0x00, 0x00, 0x20, 0x10, // Fragment Offset=16, No More Fragments
             0x40, 0x01, 0x00, 0x00,
             0x7f, 0x00, 0x00, 0x01,
             0x7f, 0x00, 0x00, 0x01,
-            // Payload
-            0x0c, 0x0d, 0x0e, 0x0f,
+            0x00, 0x50, 0x00, 0x50,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
             0x10, 0x11, 0x12, 0x13
-        ], 0);
-
+        ][..]), 0);
         (frag1, frag2, frag3)
     }
 
