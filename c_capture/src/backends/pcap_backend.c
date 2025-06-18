@@ -237,7 +237,7 @@ int pcap_backend_stop(capture_handle_t* handle) {
         printf("[pcap_backend_stop] ERROR: backend is NULL\n");
         return -1;
     }
-    
+
     backend->running = false;
     if (backend->handle) {
         printf("[pcap_backend_stop] calling pcap_breakloop, handle=%p\n", backend->handle);
@@ -246,9 +246,9 @@ int pcap_backend_stop(capture_handle_t* handle) {
         
         if (backend->handle) {
             printf("[pcap_backend_stop] calling pcap_close, handle=%p\n", backend->handle);
-            pcap_close(backend->handle);
-            backend->handle = NULL;
-        }
+        pcap_close(backend->handle);
+        backend->handle = NULL;
+    }
     }
     
     printf("[pcap_backend_stop] leave\n");
@@ -330,24 +330,19 @@ typedef struct {
 
 // 操作函数表
 static capture_backend_ops_t pcap_backend_ops = {
-    .init = pcap_backend_init,
-    .cleanup = pcap_backend_cleanup,
-    .open = pcap_backend_open,
-    .close = pcap_backend_close,
-    .start = pcap_backend_start,
-    .stop = pcap_backend_stop,
-    .pause = NULL,
-    .resume = NULL,
-    .set_filter = NULL,
-    .get_stats = pcap_backend_get_stats,
+    .init = (int (*)(void*, const capture_config_t*))pcap_backend_init,
+    .cleanup = (void (*)(void*))pcap_backend_cleanup,
+    .start = (int (*)(void*, packet_callback_t, void*))pcap_backend_start,
+    .stop = (int (*)(void*))pcap_backend_stop,
+    .get_stats = (int (*)(void*, capture_stats_t*))pcap_backend_get_stats,
+    .get_version = (const char* (*)(void*))pcap_backend_get_version,
+    .is_feature_supported = (bool (*)(void*, const char*))pcap_backend_is_feature_supported,
+    .set_option = (int (*)(void*, const char*, const void*))pcap_backend_set_option,
+    .get_option = (int (*)(void*, const char*, void*))pcap_backend_get_option,
     .get_devices = pcap_backend_get_devices,
     .free_devices = pcap_backend_free_devices,
     .get_name = pcap_backend_get_name,
-    .get_version = pcap_backend_get_version,
     .get_description = pcap_backend_get_description,
-    .is_feature_supported = pcap_backend_is_feature_supported,
-    .set_option = pcap_backend_set_option,
-    .get_option = pcap_backend_get_option,
 };
 
 // 创建 libpcap 后端

@@ -72,6 +72,7 @@ CMAKE_BINARY_DIR = /workspaces/reassamble/c_capture/build
 # Directory level rules for the build root directory
 
 # The main recursive "all" target.
+all: CMakeFiles/capture_static.dir/all
 all: CMakeFiles/capture.dir/all
 
 .PHONY : all
@@ -82,9 +83,37 @@ preinstall:
 .PHONY : preinstall
 
 # The main recursive "clean" target.
+clean: CMakeFiles/capture_static.dir/clean
 clean: CMakeFiles/capture.dir/clean
 
 .PHONY : clean
+
+#=============================================================================
+# Target rules for target CMakeFiles/capture_static.dir
+
+# All Build rule for target.
+CMakeFiles/capture_static.dir/all:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/capture_static.dir/build.make CMakeFiles/capture_static.dir/depend
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/capture_static.dir/build.make CMakeFiles/capture_static.dir/build
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir=/workspaces/reassamble/c_capture/build/CMakeFiles --progress-num=4,5,6 "Built target capture_static"
+.PHONY : CMakeFiles/capture_static.dir/all
+
+# Build rule for subdir invocation for target.
+CMakeFiles/capture_static.dir/rule: cmake_check_build_system
+	$(CMAKE_COMMAND) -E cmake_progress_start /workspaces/reassamble/c_capture/build/CMakeFiles 3
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 CMakeFiles/capture_static.dir/all
+	$(CMAKE_COMMAND) -E cmake_progress_start /workspaces/reassamble/c_capture/build/CMakeFiles 0
+.PHONY : CMakeFiles/capture_static.dir/rule
+
+# Convenience name for target.
+capture_static: CMakeFiles/capture_static.dir/rule
+
+.PHONY : capture_static
+
+# clean rule for target.
+CMakeFiles/capture_static.dir/clean:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/capture_static.dir/build.make CMakeFiles/capture_static.dir/clean
+.PHONY : CMakeFiles/capture_static.dir/clean
 
 #=============================================================================
 # Target rules for target CMakeFiles/capture.dir

@@ -75,18 +75,6 @@ CMAKE_BINARY_DIR = /workspaces/reassamble/c_capture/build
 #=============================================================================
 # Targets provided globally by CMake.
 
-# Special rule for the target install/strip
-install/strip: preinstall
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --cyan "Installing the project stripped..."
-	/usr/bin/cmake -DCMAKE_INSTALL_DO_STRIP=1 -P cmake_install.cmake
-.PHONY : install/strip
-
-# Special rule for the target install/strip
-install/strip/fast: preinstall/fast
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --cyan "Installing the project stripped..."
-	/usr/bin/cmake -DCMAKE_INSTALL_DO_STRIP=1 -P cmake_install.cmake
-.PHONY : install/strip/fast
-
 # Special rule for the target install/local
 install/local: preinstall
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --cyan "Installing only the local directory..."
@@ -143,6 +131,18 @@ edit_cache/fast: edit_cache
 
 .PHONY : edit_cache/fast
 
+# Special rule for the target install/strip
+install/strip: preinstall
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --cyan "Installing the project stripped..."
+	/usr/bin/cmake -DCMAKE_INSTALL_DO_STRIP=1 -P cmake_install.cmake
+.PHONY : install/strip
+
+# Special rule for the target install/strip
+install/strip/fast: preinstall/fast
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --cyan "Installing the project stripped..."
+	/usr/bin/cmake -DCMAKE_INSTALL_DO_STRIP=1 -P cmake_install.cmake
+.PHONY : install/strip/fast
+
 # The main all target
 all: cmake_check_build_system
 	$(CMAKE_COMMAND) -E cmake_progress_start /workspaces/reassamble/c_capture/build/CMakeFiles /workspaces/reassamble/c_capture/build//CMakeFiles/progress.marks
@@ -176,6 +176,19 @@ depend:
 .PHONY : depend
 
 #=============================================================================
+# Target rules for targets named capture_static
+
+# Build rule for target.
+capture_static: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 capture_static
+.PHONY : capture_static
+
+# fast build rule for target.
+capture_static/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/capture_static.dir/build.make CMakeFiles/capture_static.dir/build
+.PHONY : capture_static/fast
+
+#=============================================================================
 # Target rules for targets named capture
 
 # Build rule for target.
@@ -194,6 +207,7 @@ src/backends/pcap_backend.o: src/backends/pcap_backend.c.o
 
 # target to build an object file
 src/backends/pcap_backend.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/capture_static.dir/build.make CMakeFiles/capture_static.dir/src/backends/pcap_backend.c.o
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/capture.dir/build.make CMakeFiles/capture.dir/src/backends/pcap_backend.c.o
 .PHONY : src/backends/pcap_backend.c.o
 
@@ -203,6 +217,7 @@ src/backends/pcap_backend.i: src/backends/pcap_backend.c.i
 
 # target to preprocess a source file
 src/backends/pcap_backend.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/capture_static.dir/build.make CMakeFiles/capture_static.dir/src/backends/pcap_backend.c.i
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/capture.dir/build.make CMakeFiles/capture.dir/src/backends/pcap_backend.c.i
 .PHONY : src/backends/pcap_backend.c.i
 
@@ -212,6 +227,7 @@ src/backends/pcap_backend.s: src/backends/pcap_backend.c.s
 
 # target to generate assembly for a file
 src/backends/pcap_backend.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/capture_static.dir/build.make CMakeFiles/capture_static.dir/src/backends/pcap_backend.c.s
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/capture.dir/build.make CMakeFiles/capture.dir/src/backends/pcap_backend.c.s
 .PHONY : src/backends/pcap_backend.c.s
 
@@ -221,6 +237,7 @@ src/capture.o: src/capture.c.o
 
 # target to build an object file
 src/capture.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/capture_static.dir/build.make CMakeFiles/capture_static.dir/src/capture.c.o
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/capture.dir/build.make CMakeFiles/capture.dir/src/capture.c.o
 .PHONY : src/capture.c.o
 
@@ -230,6 +247,7 @@ src/capture.i: src/capture.c.i
 
 # target to preprocess a source file
 src/capture.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/capture_static.dir/build.make CMakeFiles/capture_static.dir/src/capture.c.i
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/capture.dir/build.make CMakeFiles/capture.dir/src/capture.c.i
 .PHONY : src/capture.c.i
 
@@ -239,6 +257,7 @@ src/capture.s: src/capture.c.s
 
 # target to generate assembly for a file
 src/capture.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/capture_static.dir/build.make CMakeFiles/capture_static.dir/src/capture.c.s
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/capture.dir/build.make CMakeFiles/capture.dir/src/capture.c.s
 .PHONY : src/capture.c.s
 
@@ -255,6 +274,7 @@ help:
 	@echo "... list_install_components"
 	@echo "... rebuild_cache"
 	@echo "... capture"
+	@echo "... capture_static"
 	@echo "... src/backends/pcap_backend.o"
 	@echo "... src/backends/pcap_backend.i"
 	@echo "... src/backends/pcap_backend.s"

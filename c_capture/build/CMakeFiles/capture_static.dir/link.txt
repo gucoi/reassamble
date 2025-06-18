@@ -1,0 +1,2 @@
+/usr/bin/ar qc lib/libcapture.a CMakeFiles/capture_static.dir/src/capture.c.o CMakeFiles/capture_static.dir/src/backends/pcap_backend.c.o
+/usr/bin/ranlib lib/libcapture.a

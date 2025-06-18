@@ -1,0 +1,63 @@
+[package]
+name = "reassamble"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = [
+    ".",
+    "rust_core"
+]
+
+[dependencies]
+rust_core = { path = "./rust_core" }
+tokio = { version = "1.0", features = ["full"] }
+libc = "0.2"
+bytes = "1.10.1"
+num_cpus = "1.16"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[profile.bench]
+debug = true
+
+# Criterion 配置
+[package.metadata.criterion]
+measurement_time = 1 # 秒数
+warm_up_time = 0.5 # 秒数
+sample_size = 10 # 样本大小
+confidence_level = 0.95
+noise_threshold = 0.05
+nresamples = 5
+
+[[bench]]
+name = "performance"
+path = "benches/examples/performance.rs"
+harness = false
+
+[[bench]]
+name = "integration"
+path = "benches/examples/integration.rs"
+harness = false
+
+[[bench]]
+name = "advanced"
+harness = false
+path = "benches/examples/advanced.rs"
+
+[[bench]]
+name = "concurrent"
+harness = false
+path = "benches/examples/concurrent.rs"
+
+[[bench]]
+name = "packet_processing"
+harness = false
+path = "benches/examples/packet_processing.rs"
+
+[[bench]]
+name = "reassembly_correctness"
+harness = false
+path = "benches/examples/reassembly_correctness.rs" 
+ 

@@ -18,21 +18,26 @@ set(SOURCES
     src/backends/pcap_backend.c
 )
 
-# 创建共享库
+# 创建共享库和静态库
 add_library(capture SHARED ${SOURCES})
+add_library(capture_static STATIC ${SOURCES})
+set_target_properties(capture_static PROPERTIES OUTPUT_NAME capture)
 
 # 链接 libpcap
 target_link_libraries(capture ${PCAP_LIBRARIES})
+target_link_libraries(capture_static ${PCAP_LIBRARIES})
 
 # 设置输出目录
-set_target_properties(capture PROPERTIES
+set_target_properties(capture capture_static PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
+    ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
 # 安装规则
-install(TARGETS capture
+install(TARGETS capture capture_static
     LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
     RUNTIME DESTINATION bin
 )
 

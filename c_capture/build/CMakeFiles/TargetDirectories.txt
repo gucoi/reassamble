@@ -1,7 +1,8 @@
-/workspaces/reassamble/c_capture/build/CMakeFiles/install/strip.dir
 /workspaces/reassamble/c_capture/build/CMakeFiles/install/local.dir
 /workspaces/reassamble/c_capture/build/CMakeFiles/install.dir
 /workspaces/reassamble/c_capture/build/CMakeFiles/list_install_components.dir
 /workspaces/reassamble/c_capture/build/CMakeFiles/rebuild_cache.dir
 /workspaces/reassamble/c_capture/build/CMakeFiles/edit_cache.dir
+/workspaces/reassamble/c_capture/build/CMakeFiles/install/strip.dir
+/workspaces/reassamble/c_capture/build/CMakeFiles/capture_static.dir
 /workspaces/reassamble/c_capture/build/CMakeFiles/capture.dir
