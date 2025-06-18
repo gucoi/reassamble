@@ -1,19 +1,15 @@
-mod decode;
-mod error;
+mod decode_context;
 
-pub use decode::{
-    DecodedPacket,
-    IpHeader,
-    TransportProtocol,
-    decode_ip_header,
-    decode_packet,
-    decode_packet_with_buffer,
-};
-pub use error::{
-    DecodeError,
-    DecodeResult,
-    IpHeaderError,
-    TcpHeaderError,
-    UdpHeaderError,
-    BufferError,
-};
+pub use decode_context::{DecodeContext, DecodeStats};
+
+mod decode;
+pub use decode::*;
+
+mod decode_tcp;
+pub use decode_tcp::*;
+
+mod decode_udp;
+pub use decode_udp::*;
+
+mod error;
+pub use error::*;

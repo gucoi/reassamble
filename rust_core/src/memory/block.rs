@@ -1,8 +1,6 @@
 use std::sync::Arc;
 use parking_lot::Mutex;
-use std::ops::{Deref, DerefMut};
-use bytes::{Bytes, BytesMut, BufMut};
-use std::sync::atomic::{AtomicBool, Ordering};
+use bytes::{Bytes, BytesMut};
 
 /// 内存块结构
 #[derive(Debug, Clone)]

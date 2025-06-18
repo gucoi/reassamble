@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
-use rust_core::decode::{decode_packet, decode_packet_with_buffer};
+use rust_core::decode::decode_packet;
 use rust_core::SafePacket;
 use rand::Rng;
 use std::hint::black_box;
@@ -160,7 +160,7 @@ fn bench_decode(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("original", size),
             &packet,
-            |b, p| b.iter(|| black_box(decode_packet(p)))
+            |b, p| b.iter(|| black_box(decode_packet(p, &p.data[..])))
         );
         
         group.bench_with_input(
@@ -168,7 +168,7 @@ fn bench_decode(c: &mut Criterion) {
             &packet,
             |b, p| b.iter(|| {
                 buffer.clear();
-                black_box(decode_packet_with_buffer(p, &mut buffer))
+                black_box(decode_packet(p, &mut buffer))
             })
         );
     }
@@ -180,7 +180,7 @@ fn bench_decode(c: &mut Criterion) {
         &option_packet,
         |b, p| b.iter(|| {
             buffer.clear();
-            black_box(decode_packet_with_buffer(p, &mut buffer))
+            black_box(decode_packet(p, &mut buffer))
         })
     );
     
@@ -192,7 +192,7 @@ fn bench_decode(c: &mut Criterion) {
         |b, packets| b.iter(|| {
             buffer.clear();
             for packet in packets {
-                let _ = black_box(decode_packet_with_buffer(packet, &mut buffer));
+                let _ = black_box(decode_packet(packet, &mut buffer));
             }
         })
     );

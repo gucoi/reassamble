@@ -2,7 +2,7 @@ use thiserror::Error;
 use std::net::IpAddr;
 
 /// 解码错误类型
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum DecodeError {
     /// 数据包为空
     #[error("空数据包")]
@@ -50,14 +50,14 @@ pub enum DecodeError {
 }
 
 /// IP头部错误类型
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum IpHeaderError {
-    /// 版本错误
+    /// 头部长度不足
     #[error("IP头部长度不足")]
     TooShort,
 
-    /// IHL错误
-    #[error("IP版本不支持: {version}")]
+    /// 不支持的版本
+    #[error("不支持的IP版本: {version}")]
     UnsupportedVersion {
         version: u8,
     },
@@ -66,6 +66,12 @@ pub enum IpHeaderError {
     #[error("无效的总长度: {length}")]
     InvalidTotalLength {
         length: u16,
+    },
+
+    /// 不支持的协议
+    #[error("不支持的协议: {protocol}")]
+    UnsupportedProtocol {
+        protocol: u8,
     },
 
     /// 源IP地址错误
@@ -83,20 +89,30 @@ pub enum IpHeaderError {
     /// 校验和错误
     #[error("IP头部校验和错误")]
     InvalidChecksum,
+
+    /// 分片数量过多
+    #[error("分片数量超过限制")]
+    TooManyFragments,
+
+    /// 无效的分片
+    #[error("无效的分片数据")]
+    InvalidFragment,
+
+    /// 分片未完成
+    #[error("分片重组未完成")]
+    IncompleteFragments,
 }
 
 /// TCP头部错误类型
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum TcpHeaderError {
-    /// 头部长度错误
+    /// 头部长度不足
     #[error("TCP头部长度不足")]
     TooShort,
 
     /// 头部长度无效
-    #[error("无效的TCP头部长度: {length}")]
-    InvalidHeaderLength {
-        length: u8,
-    },
+    #[error("无效的TCP头部长度: {0}")]
+    InvalidLength(usize),
 
     /// 端口错误
     #[error("无效的端口号: {port}")]
@@ -111,10 +127,8 @@ pub enum TcpHeaderError {
     },
 
     /// 标志错误
-    #[error("无效的TCP标志: {flags:02x}")]
-    InvalidFlags {
-        flags: u8,
-    },
+    #[error("无效的TCP标志位: {0}")]
+    InvalidFlags(u8),
 
     /// 校验和错误
     #[error("TCP头部校验和错误")]
@@ -122,17 +136,15 @@ pub enum TcpHeaderError {
 }
 
 /// UDP头部错误类型
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum UdpHeaderError {
     /// 长度错误
     #[error("UDP头部长度不足")]
     TooShort,
 
     /// 无效长度
-    #[error("无效的UDP长度: {length}")]
-    InvalidLength {
-        length: u16,
-    },
+    #[error("无效的UDP长度")]
+    InvalidLength,
 
     /// 端口错误
     #[error("无效的端口号: {port}")]
@@ -146,7 +158,7 @@ pub enum UdpHeaderError {
 }
 
 /// 缓冲区错误类型
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum BufferError {
     /// 缓冲区容量不足
     #[error("缓冲区太短")]

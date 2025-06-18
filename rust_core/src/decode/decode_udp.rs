@@ -1,6 +1,9 @@
+use super::error::{DecodeResult, UdpHeaderError, DecodeError};
+use super::decode::TransportProtocol;
+use super::DecodeContext;
+use bytes::BytesMut;
+use log::{trace, debug, info, warn, error};
 use crate::SafePacket;
-use super::error::{DecodeError, DecodeResult, UdpHeaderError};
-use super::decode::{IpHeader, DecodedPacket, TransportProtocol};
 
 // UDP相关常量
 const MIN_UDP_SIZE: usize = 42;  // 以太网(14) + IP(20) + UDP(8)
@@ -10,157 +13,95 @@ const UDP_DEST_PORT_OFFSET: usize = 2;  // UDP目标端口偏移
 const UDP_LENGTH_OFFSET: usize = 4;  // UDP长度偏移
 const UDP_CHECKSUM_OFFSET: usize = 6;  // UDP校验和偏移
 
-/// 解码UDP包
-pub fn decode_udp_packet(packet: &SafePacket, ip_header: &IpHeader) -> DecodeResult<DecodedPacket> {
-    if packet.data.len() < MIN_UDP_SIZE {
-        return Err(DecodeError::InsufficientLength {
-            required: MIN_UDP_SIZE,
-            actual: packet.data.len(),
-        });
+/// 使用缓冲区解码UDP包（支持上下文统计与错误）
+pub fn decode_udp_packet(ctx: &mut DecodeContext, buffer: &[u8]) -> DecodeResult<TransportProtocol> {
+    trace!("开始解码UDP包，缓冲区大小: {}", buffer.len());
+    
+    if buffer.len() < UDP_HEADER_SIZE {
+        warn!("UDP头部太短，无法解析: {} < {}", buffer.len(), UDP_HEADER_SIZE);
+        ctx.record_error("UDP头部太短，无法解析");
+        return Err(UdpHeaderError::TooShort.into());
     }
 
-    let ip_header_len = (packet.data[14] & 0x0f) * 4;
-    let udp_offset = 14 + ip_header_len as usize;
-    let payload_offset = udp_offset + UDP_HEADER_SIZE;
+    let src_port = u16::from_be_bytes([buffer[0], buffer[1]]);
+    let dst_port = u16::from_be_bytes([buffer[2], buffer[3]]);
+    let udp_length = u16::from_be_bytes([buffer[4], buffer[5]]);
 
-    // 验证UDP长度
-    let udp_length = u16::from_be_bytes([
-        packet.data[udp_offset + UDP_LENGTH_OFFSET],
-        packet.data[udp_offset + UDP_LENGTH_OFFSET + 1]
-    ]);
-    if udp_length < UDP_HEADER_SIZE as u16 || udp_length > packet.data.len() as u16 - udp_offset as u16 {
-        return Err(UdpHeaderError::InvalidLength { length: udp_length }.into());
+    trace!("UDP头部字段解析: src_port={}, dst_port={}, length={}", src_port, dst_port, udp_length);
+
+    if udp_length < UDP_HEADER_SIZE as u16 || udp_length as usize > buffer.len() {
+        warn!("UDP长度无效: {} (头部大小: {}, 缓冲区大小: {})", 
+              udp_length, UDP_HEADER_SIZE, buffer.len());
+        ctx.record_error(&format!("UDP长度无效: {} (头部大小: {}, 缓冲区大小: {})", 
+                                 udp_length, UDP_HEADER_SIZE, buffer.len()));
+        return Err(UdpHeaderError::InvalidLength.into());
     }
 
-    // 验证端口号
-    let src_port = u16::from_be_bytes([
-        packet.data[udp_offset + UDP_SRC_PORT_OFFSET],
-        packet.data[udp_offset + UDP_SRC_PORT_OFFSET + 1]
-    ]);
-    let dst_port = u16::from_be_bytes([
-        packet.data[udp_offset + UDP_DEST_PORT_OFFSET],
-        packet.data[udp_offset + UDP_DEST_PORT_OFFSET + 1]
-    ]);
-    if src_port == 0 || dst_port == 0 {
-        return Err(UdpHeaderError::InvalidPort { port: if src_port == 0 { src_port } else { dst_port } }.into());
-    }
+    // 提取数据部分
+    let payload = if buffer.len() > UDP_HEADER_SIZE {
+        let payload_data = &buffer[UDP_HEADER_SIZE..];
+        trace!("UDP负载数据: 长度={}", payload_data.len());
+        BytesMut::from(payload_data)
+    } else {
+        trace!("UDP包无负载数据");
+        BytesMut::new()
+    };
 
-    // 提取payload
-    let payload = packet.data[payload_offset..].to_vec();
-
-    Ok(DecodedPacket {
-        timestamp: packet.timestamp,
-        ip_header: ip_header.clone(),
+    let payload_len = payload.len();
+    let udp_protocol = TransportProtocol::UDP {
         src_port,
         dst_port,
-        protocol: TransportProtocol::UDP {
-            length: udp_length,
-            checksum: u16::from_be_bytes([
-                packet.data[udp_offset + UDP_CHECKSUM_OFFSET],
-                packet.data[udp_offset + UDP_CHECKSUM_OFFSET + 1]
-            ]),
-        },
-        payload: payload.into(),
-    })
-}
-
-/// 使用缓冲区解码UDP包
-pub fn decode_udp_packet_with_buffer(
-    packet: &SafePacket,
-    buffer: &[u8],
-    ip_header: &IpHeader,
-) -> DecodeResult<DecodedPacket> {
-    if buffer.len() < MIN_UDP_SIZE {
-        return Err(DecodeError::InsufficientLength {
-            required: MIN_UDP_SIZE,
-            actual: buffer.len(),
-        });
-    }
-
-    let ip_header_len = (buffer[14] & 0x0f) * 4;
-    let udp_offset = 14 + ip_header_len as usize;
-    let payload_offset = udp_offset + UDP_HEADER_SIZE;
-
-    // 验证UDP长度
-    let udp_length = u16::from_be_bytes([
-        buffer[udp_offset + UDP_LENGTH_OFFSET],
-        buffer[udp_offset + UDP_LENGTH_OFFSET + 1]
-    ]);
-    if udp_length < UDP_HEADER_SIZE as u16 || udp_length > buffer.len() as u16 - udp_offset as u16 {
-        return Err(UdpHeaderError::InvalidLength { length: udp_length }.into());
-    }
-
-    // 验证端口号
-    let src_port = u16::from_be_bytes([
-        buffer[udp_offset + UDP_SRC_PORT_OFFSET],
-        buffer[udp_offset + UDP_SRC_PORT_OFFSET + 1]
-    ]);
-    let dst_port = u16::from_be_bytes([
-        buffer[udp_offset + UDP_DEST_PORT_OFFSET],
-        buffer[udp_offset + UDP_DEST_PORT_OFFSET + 1]
-    ]);
-    if src_port == 0 || dst_port == 0 {
-        return Err(UdpHeaderError::InvalidPort { port: if src_port == 0 { src_port } else { dst_port } }.into());
-    }
-
-    // 使用预分配的 Vec 存储 payload
-    let mut payload = Vec::with_capacity(buffer.len() - payload_offset);
-    payload.extend_from_slice(&buffer[payload_offset..]);
-
-    Ok(DecodedPacket {
-        timestamp: packet.timestamp,
-        ip_header: ip_header.clone(),
-        src_port,
-        dst_port,
-        protocol: TransportProtocol::UDP {
-            length: udp_length,
-            checksum: u16::from_be_bytes([
-                buffer[udp_offset + UDP_CHECKSUM_OFFSET],
-                buffer[udp_offset + UDP_CHECKSUM_OFFSET + 1]
-            ]),
-        },
-        payload: payload.into(),
-    })
+        payload,
+    };
+    
+    debug!("UDP包解码成功: src_port={}, dst_port={}, payload_len={}", 
+           src_port, dst_port, payload_len);
+    
+    Ok(udp_protocol)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::BytesMut;
+    use crate::SafePacket;
 
     #[test]
     fn test_decode_udp_packet() {
-        let test_packet = SafePacket::new(vec![
-            0x45, 0x00, 0x00, 0x1C, // IP header
-            0x00, 0x00, 0x40, 0x00,
-            0x40, 0x11, 0x00, 0x00,
-            0x7f, 0x00, 0x00, 0x01,
-            0x7f, 0x00, 0x00, 0x01,
-            // UDP header
-            0x00, 0x35, 0x00, 0x35,
-            0x00, 0x08, 0x00, 0x00
-        ], 0);
+        let test_packet = SafePacket::new(BytesMut::from(&[
+            // UDP头部 (8字节)
+            0x00, 0x35, 0x00, 0x35,             // 源端口(53), 目标端口(53)
+            0x00, 0x08, 0x00, 0x00,             // 长度(8), 校验和
+            // 数据部分
+            0x48, 0x65, 0x6c, 0x6c, 0x6f       // "Hello"
+        ][..]), 0);
 
-        let ip_header = super::super::decode::decode_ip_header(&test_packet.data[14..]).unwrap();
-        let result = decode_udp_packet(&test_packet, &ip_header);
-        assert!(result.is_ok());
+        let mut ctx = DecodeContext::new();
+        let result = decode_udp_packet(&mut ctx, &test_packet.data);
+        assert!(result.is_ok(), "UDP包解码失败: {:?}", result);
         
         let decoded = result.unwrap();
-        assert_eq!(decoded.src_port, 53);
-        assert_eq!(decoded.dst_port, 53);
+        match decoded {
+            TransportProtocol::UDP { src_port, dst_port, payload } => {
+                assert_eq!(src_port, 53, "源端口不匹配");
+                assert_eq!(dst_port, 53, "目标端口不匹配");
+                assert_eq!(&payload[..], b"Hello", "数据部分不匹配");
+            }
+            _ => panic!("Expected UDP protocol"),
+        }
     }
 
     #[test]
     fn test_decode_invalid_udp_length() {
-        let mut packet = SafePacket::new(vec![0u8; 42], 0);
-        // 设置有效的IP头部
-        packet.data[0] = 0x45;
-        packet.data[9] = 0x11; // UDP协议
-        // 设置无效的UDP长度
-        packet.data[38] = 0x00;
-        packet.data[39] = 0x04; // 长度小于8
-        
-        let ip_header = super::super::decode::decode_ip_header(&packet.data[14..]).unwrap();
-        let result = decode_udp_packet(&packet, &ip_header);
-        assert!(matches!(result, Err(DecodeError::UdpHeaderError(_))));
+        let packet = SafePacket::new(BytesMut::from(&[
+            // UDP头部 (8字节)
+            0x00, 0x35, 0x00, 0x35,             // 源端口(53), 目标端口(53)
+            0x00, 0x04, 0x00, 0x00              // 长度(4), 校验和 - 无效长度
+        ][..]), 0);
+
+        let mut ctx = DecodeContext::new();
+        let result = decode_udp_packet(&mut ctx, &packet.data);
+        assert!(matches!(result, Err(DecodeError::UdpHeaderError(_))), "应该返回UDP头部错误");
+        assert_eq!(ctx.stats.errors, 1);
     }
 } 

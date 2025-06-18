@@ -37,7 +37,7 @@ fn main() {
 
     // 链接 libcapture.so
     println!("cargo:rustc-link-lib=dylib=capture");
-    println!("cargo:rustc-link-search=native=../c_capture/build/lib");
+    println!("cargo:rustc-link-search=native={}", out_dir.parent().unwrap().parent().unwrap().parent().unwrap().join("c_capture/build/lib").display());
     
     // 链接 libpcap
     println!("cargo:rustc-link-lib=dylib=pcap");

@@ -6,6 +6,7 @@ pub mod stream;
 pub mod processor;
 pub mod ffi;
 pub mod memory;
+pub mod util;
 
 
 // Re-export commonly used types
@@ -18,11 +19,7 @@ pub use memory::{MemoryPool, MemoryBlock, MemoryPoolConfig, init_global_pool, ge
 pub use tokio::runtime::Runtime;
 pub use std::sync::OnceLock;
 pub use std::sync::Arc;
-use futures::TryFutureExt;
-use bytes::{Bytes, BytesMut, BufMut};
-use std::time::{Duration, Instant};
-use log::{info, warn, error};
-use thiserror::Error;
+use bytes::BytesMut;
 
 // 重新导出常用类型
 pub use ffi::types::{CapturePacket, ReassemblePacket};
@@ -109,12 +106,26 @@ impl SafePacket {
     }
 }
 
+#[repr(C)]
+pub enum CResult {
+    Ok = 0,
+    Err = 1,
+}
+
 #[no_mangle]
-pub extern "C" fn process_packet(packet: *const Packet) -> Result<()> {
-    if packet.is_null() || unsafe { (*packet).data.is_null() } {
+pub extern "C" fn process_packet(packet: *const Packet) -> CResult {
+    match unsafe { process_packet_internal(packet) } {
+        Ok(_) => CResult::Ok,
+        Err(_) => CResult::Err,
+    }
+}
+
+unsafe fn process_packet_internal(packet: *const Packet) -> std::result::Result<(), ReassembleError> {
+    if packet.is_null() {
         return Err(ReassembleError::PacketError(PacketError::NullPointer));
     }
 
+    let packet = &*packet;
     let processor = get_processor();
     let rt = get_runtime();
     
@@ -132,7 +143,7 @@ pub extern "C" fn process_packet(packet: *const Packet) -> Result<()> {
         // 在工作线程中处理
         let result = processor.process_packet(&packet_data).await?;
 
-        if let Some(data) = result {
+        if let Some(data) = result.data {
             println!("Reassembled {} bytes", data.len());
         }
         
@@ -140,3 +151,7 @@ pub extern "C" fn process_packet(packet: *const Packet) -> Result<()> {
     })
 }
 
+// 全局日志初始化函数
+pub fn init_global_logger() {
+    crate::util::log::init_logger();
+}

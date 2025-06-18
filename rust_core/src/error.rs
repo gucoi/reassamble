@@ -17,6 +17,18 @@ pub enum PacketError {
     
     #[error("IO错误: {0}")]
     IoError(#[from] std::io::Error),
+    
+    #[error("分片不完整")]
+    IncompleteFragment,
+    
+    #[error("无效分片")]
+    InvalidFragment,
+    
+    #[error("分片数量过多")]
+    TooManyFragments,
+    
+    #[error("分片重组失败")]
+    ReassemblyFailed,
 }
 
 #[derive(Debug, Error)]
@@ -29,6 +41,9 @@ pub enum ReassembleError {
     
     #[error("流重组错误: {0}")]
     StreamError(String),
+    
+    #[error("无效数据: {0}")]
+    InvalidData(String),
     
     #[error(transparent)]
     PacketError(#[from] PacketError),

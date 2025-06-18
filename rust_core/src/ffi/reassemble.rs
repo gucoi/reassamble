@@ -1,13 +1,24 @@
 use super::types::ReassemblePacket;
-use crate::error::Result;
+use crate::error::{ReassembleError, PacketError};
 use bytes;
 
+#[repr(C)]
+pub enum CResult {
+    Ok = 0,
+    Err = 1,
+}
+
 #[no_mangle]
-pub extern "C" fn process_reassemble_packet(packet: *const ReassemblePacket) -> Result<()> {
-    if packet.is_null() || unsafe { (*packet).data.is_null() } {
-        return Err(crate::error::ReassembleError::PacketError(
-            crate::error::PacketError::NullPointer,
-        ));
+pub extern "C" fn process_reassemble_packet(packet: *const ReassemblePacket) -> CResult {
+    match unsafe { process_reassemble_packet_internal(packet) } {
+        Ok(_) => CResult::Ok,
+        Err(_) => CResult::Err,
+    }
+}
+
+unsafe fn process_reassemble_packet_internal(packet: *const ReassemblePacket) -> std::result::Result<(), ReassembleError> {
+    if packet.is_null() {
+        return Err(ReassembleError::PacketError(PacketError::NullPointer));
     }
 
     let processor = crate::get_processor();
@@ -27,7 +38,7 @@ pub extern "C" fn process_reassemble_packet(packet: *const ReassemblePacket) -> 
         // 在工作线程中处理
         let result = processor.process_packet(&packet_data).await?;
 
-        if let Some(data) = result {
+        if let Some(data) = result.data {
             println!("Reassembled {} bytes", data.len());
         }
         

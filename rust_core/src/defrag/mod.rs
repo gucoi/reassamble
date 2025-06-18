@@ -1,3 +1,3 @@
 mod defrag;
 
-pub use defrag::IpDefragmenter;
+pub use defrag::{IpDefragmenter, FragmentPolicy};

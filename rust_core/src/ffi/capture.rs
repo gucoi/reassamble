@@ -1,5 +1,5 @@
 use std::os::raw::{c_char, c_void};
-use super::types::{CaptureConfig, CaptureHandle, CaptureCallback, ErrorCallback, CaptureDevice, CaptureStats};
+use super::types::{CaptureConfig, CaptureHandle, CaptureCallback, ErrorCallback, CaptureStats};
 
 #[link(name = "capture")]
 extern "C" {
